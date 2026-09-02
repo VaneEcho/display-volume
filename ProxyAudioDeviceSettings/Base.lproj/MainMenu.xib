@@ -15,13 +15,7 @@
         <customObject id="-3" userLabel="Application" customClass="NSObject"/>
         <customObject id="MLf-en-Bn8" userLabel="WindowDelegate" customClass="WindowDelegate">
             <connections>
-                <outlet property="alwaysRadioButton" destination="Qmk-xY-0ok" id="2yu-wp-avo"/>
-                <outlet property="bufferSizeComboBox" destination="Tu4-jv-3Xp" id="e5z-EY-esA"/>
-                <outlet property="deviceNameTextField" destination="Vuz-aO-zYY" id="Jbh-lS-r17"/>
-                <outlet property="hideWhenUnavailableCheckbox" destination="hWu-01-chk" id="hWu-01-out"/>
-                <outlet property="outputDeviceComboBox" destination="8bM-6q-Jq9" id="hOu-HN-ffg"/>
-                <outlet property="proxiedDeviceIsActiveRadioButton" destination="utN-wS-WdQ" id="Bu7-vU-kg2"/>
-                <outlet property="userIsActiveRadioButton" destination="dQw-jZ-xGK" id="QH7-ch-XLv"/>
+                <outlet property="window" destination="QvC-M9-y7g" id="win-01-out"/>
             </connections>
         </customObject>
         <customObject id="Voe-Tx-rLC" userLabel="AppDelegate" customClass="AppDelegate">

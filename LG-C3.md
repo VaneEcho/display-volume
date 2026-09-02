@@ -34,19 +34,28 @@ xcodebuild -project proxyAudioDevice.xcodeproj -scheme "Proxy Audio Device Setti
 
 ## 安装
 
-安装前备份旧驱动，并确认 `/Library/Audio/Plug-Ins/HAL` 里没有同 UUID 的两份驱动。
+把 `Proxy Audio Device Settings.app` 拖到「应用程序」，打开后：
+
+- 未装驱动时点「安装驱动」，输入密码
+- 绿色对勾表示驱动已就绪
+- 电视开着时把目标选成 **LG TV SSCR2**
+- 系统声音默认输出选 **Proxy Audio Device**
+- 「保持工作」用「使用电脑时」
+
+不要勾选隐藏 Proxy，也不要走扬声器回退（界面里已去掉这两项）。
+
+命令行安装仍然可用：
 
 ```
-sudo mkdir -p /Library/Audio/Plug-Ins/HAL
 sudo rm -rf /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
-sudo cp -R build/Release/ProxyAudioDevice.driver /Library/Audio/Plug-Ins/HAL/
+sudo cp -R "Proxy Audio Device Settings.app/Contents/Resources/ProxyAudioDevice.driver" /Library/Audio/Plug-Ins/HAL/
 sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
 sudo killall coreaudiod
 ```
 
-然后打开 Settings，选择 LG C3，保持 Proxy Audio Device 为系统默认输出。离线回退选项默认关闭（静音）。
-
 ## 卸载
+
+在应用里点「卸载驱动」，或：
 
 ```
 sudo rm -rf /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver

@@ -3,14 +3,17 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @interface WindowDelegate : NSObject
-@property(nonatomic, strong) IBOutlet NSTextField *deviceNameTextField;
-@property(nonatomic, strong) IBOutlet NSComboBox *outputDeviceComboBox;
-@property(nonatomic, strong) IBOutlet NSComboBox *bufferSizeComboBox;
-@property(nonatomic, strong) IBOutlet NSButton *proxiedDeviceIsActiveRadioButton;
-@property(nonatomic, strong) IBOutlet NSButton *userIsActiveRadioButton;
-@property(nonatomic, strong) IBOutlet NSButton *alwaysRadioButton;
-@property(nonatomic, strong) IBOutlet NSButton *hideWhenUnavailableCheckbox;
-@property(nonatomic, strong) NSButton *offlineFallbackCheckbox;
+@property(nonatomic, strong) IBOutlet NSWindow *window;
+@property(nonatomic, strong) NSTextField *deviceNameTextField;
+@property(nonatomic, strong) NSPopUpButton *outputDevicePopUp;
+@property(nonatomic, strong) NSPopUpButton *bufferSizePopUp;
+@property(nonatomic, strong) NSButton *proxiedDeviceIsActiveRadioButton;
+@property(nonatomic, strong) NSButton *userIsActiveRadioButton;
+@property(nonatomic, strong) NSButton *alwaysRadioButton;
+@property(nonatomic, strong) NSTextField *driverStatusLabel;
+@property(nonatomic, strong) NSImageView *driverStatusImage;
+@property(nonatomic, strong) NSButton *driverActionButton;
+@property(nonatomic, strong) NSView *settingsContainer;
 
 - (void)awakeFromNib;
 - (IBAction)deviceNameEntered:(id)sender;
@@ -19,8 +22,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (IBAction)proxiedDeviceIsActiveConditionSelected:(id)sender;
 - (IBAction)userIsActiveConditionSelected:(id)sender;
 - (IBAction)alwaysConditionSelected:(id)sender;
-- (IBAction)hideWhenUnavailableToggled:(id)sender;
-- (IBAction)offlineFallbackToggled:(id)sender;
+- (IBAction)driverActionClicked:(id)sender;
 
 @end
 
