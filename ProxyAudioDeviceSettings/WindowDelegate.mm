@@ -139,7 +139,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
 
     NSStackView *root = [[NSStackView alloc] init];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
-    root.alignment = NSLayoutAttributeLeading;
+    root.alignment = NSLayoutAttributeWidth;
     root.spacing = 18;
     root.translatesAutoresizingMaskIntoConstraints = NO;
     [content addSubview:root];
@@ -157,10 +157,9 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.settingsContainer = [[NSStackView alloc] init];
     NSStackView *settings = (NSStackView *)self.settingsContainer;
     settings.orientation = NSUserInterfaceLayoutOrientationVertical;
-    settings.alignment = NSLayoutAttributeLeading;
+    settings.alignment = NSLayoutAttributeWidth;
     settings.spacing = 18;
     settings.translatesAutoresizingMaskIntoConstraints = NO;
-    [settings.widthAnchor constraintEqualToAnchor:root.widthAnchor].active = YES;
     [root addArrangedSubview:settings];
 
     [settings addArrangedSubview:[self makeSectionLabel:@"输出"]];
