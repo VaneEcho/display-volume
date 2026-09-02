@@ -23,6 +23,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (IBAction)userIsActiveConditionSelected:(id)sender;
 - (IBAction)alwaysConditionSelected:(id)sender;
 - (IBAction)driverActionClicked:(id)sender;
+- (IBAction)openSoundSettings:(id)sender;
 
 @end
 

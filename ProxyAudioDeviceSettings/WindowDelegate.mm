@@ -131,42 +131,64 @@ int onDevicesChanged(AudioObjectID inObjectID,
 
     NSWindow *window = self.window;
     window.title = @"Proxy Audio";
-    window.contentMinSize = NSMakeSize(460, 420);
-    [window setContentSize:NSMakeSize(500, 520)];
+    window.styleMask |= NSWindowStyleMaskResizable;
+    window.contentMinSize = NSMakeSize(400, 380);
+    window.contentMaxSize = NSMakeSize(900, 1200);
+    window.titlebarAppearsTransparent = NO;
 
     NSView *content = [[NSView alloc] initWithFrame:NSZeroRect];
     window.contentView = content;
 
     NSStackView *root = [[NSStackView alloc] init];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
-    root.alignment = NSLayoutAttributeWidth;
-    root.spacing = 18;
+    root.alignment = NSLayoutAttributeLeading;
+    root.spacing = 16;
     root.translatesAutoresizingMaskIntoConstraints = NO;
     [content addSubview:root];
 
     [NSLayoutConstraint activateConstraints:@[
-        [root.topAnchor constraintEqualToAnchor:content.topAnchor constant:22],
-        [root.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:22],
-        [root.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-22],
-        [root.bottomAnchor constraintLessThanOrEqualToAnchor:content.bottomAnchor constant:-22],
+        [root.topAnchor constraintEqualToAnchor:content.topAnchor constant:20],
+        [root.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:20],
+        [root.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-20],
+        [root.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-20],
     ]];
 
-    [root addArrangedSubview:[self makeDriverStatusRow]];
+    NSView *statusRow = [self makeDriverStatusRow];
+    NSView *outputForm = [self makeOutputForm];
+    NSView *activeGroup = [self makeActiveConditionGroup];
+    NSView *soundLink = [self makeSoundSettingsLink];
+
+    [root addArrangedSubview:statusRow];
     [root addArrangedSubview:[self separator]];
 
     self.settingsContainer = [[NSStackView alloc] init];
     NSStackView *settings = (NSStackView *)self.settingsContainer;
     settings.orientation = NSUserInterfaceLayoutOrientationVertical;
-    settings.alignment = NSLayoutAttributeWidth;
-    settings.spacing = 18;
+    settings.alignment = NSLayoutAttributeLeading;
+    settings.spacing = 16;
     settings.translatesAutoresizingMaskIntoConstraints = NO;
     [root addArrangedSubview:settings];
 
     [settings addArrangedSubview:[self makeSectionLabel:@"输出"]];
-    [settings addArrangedSubview:[self makeOutputForm]];
+    [settings addArrangedSubview:outputForm];
+    [settings addArrangedSubview:soundLink];
     [settings addArrangedSubview:[self separator]];
     [settings addArrangedSubview:[self makeSectionLabel:@"保持工作"]];
-    [settings addArrangedSubview:[self makeActiveConditionGroup]];
+    [settings addArrangedSubview:activeGroup];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [statusRow.widthAnchor constraintEqualToAnchor:root.widthAnchor],
+        [settings.widthAnchor constraintEqualToAnchor:root.widthAnchor],
+        [outputForm.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
+        [activeGroup.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
+    ]];
+
+    [content layoutSubtreeIfNeeded];
+    NSSize fitting = root.fittingSize;
+    fitting.width += 40;
+    fitting.height += 40;
+    fitting.width = MAX(fitting.width, 440);
+    [window setContentSize:fitting];
 
     nativeUIBuilt = true;
 }
@@ -184,6 +206,8 @@ int onDevicesChanged(AudioObjectID inObjectID,
     NSTextField *label = [NSTextField labelWithString:title];
     label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
     label.textColor = [NSColor secondaryLabelColor];
+    label.alignment = NSTextAlignmentNatural;
+    [label setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
     return label;
 }
 
@@ -213,8 +237,14 @@ int onDevicesChanged(AudioObjectID inObjectID,
     [row addArrangedSubview:self.driverStatusLabel];
     [row addArrangedSubview:spacer];
     [row addArrangedSubview:self.driverActionButton];
-    [row.widthAnchor constraintGreaterThanOrEqualToConstant:400].active = YES;
     return row;
+}
+
+- (NSView *)makeSoundSettingsLink {
+    NSButton *button = [NSButton buttonWithTitle:@"打开系统声音设置…" target:self action:@selector(openSoundSettings:)];
+    button.bezelStyle = NSBezelStyleInline;
+    button.font = [NSFont systemFontOfSize:11];
+    return button;
 }
 
 - (NSView *)makeOutputForm {
@@ -293,7 +323,9 @@ int onDevicesChanged(AudioObjectID inObjectID,
     NSTextField *hint = [NSTextField wrappingLabelWithString:caption];
     hint.font = [NSFont systemFontOfSize:11];
     hint.textColor = [NSColor secondaryLabelColor];
-    hint.preferredMaxLayoutWidth = 420;
+    hint.preferredMaxLayoutWidth = 360;
+    [hint setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                    forOrientation:NSLayoutConstraintOrientationHorizontal];
     [block addArrangedSubview:button];
     [block addArrangedSubview:hint];
     return block;
@@ -356,6 +388,12 @@ int onDevicesChanged(AudioObjectID inObjectID,
 }
 
 #pragma mark - Driver install / uninstall
+
+- (IBAction)openSoundSettings:(id)sender {
+#pragma unused(sender)
+    NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.Sound-Settings.extension"];
+    [[NSWorkspace sharedWorkspace] openURL:url];
+}
 
 - (IBAction)driverActionClicked:(id)sender {
 #pragma unused(sender)
