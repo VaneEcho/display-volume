@@ -9,9 +9,14 @@ int onDevicesChanged(AudioObjectID inObjectID,
                      const AudioObjectPropertyAddress *inAddresses,
                      void *inClientData);
 
+static NSString *const kDeviceNameCacheKey = @"deviceNameCacheByUID";
+
 @implementation WindowDelegate {
     std::vector<AudioDeviceID> currentDeviceList;
     int initializationAttemptInterval;
+    NSTimer *refreshTimer;
+    NSString *lastDeviceListSignature;
+    bool offlineFallbackUIBuilt;
 }
 
 - (void)awakeFromNib {
@@ -24,6 +29,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.alwaysRadioButton.enabled = NO;
     self.hideWhenUnavailableCheckbox.enabled = NO;
     initializationAttemptInterval = 3;
+    offlineFallbackUIBuilt = false;
     [self keepTryingToInitializeUntilSuccess];
 }
 
@@ -55,6 +61,8 @@ int onDevicesChanged(AudioObjectID inObjectID,
         return true;
     }
     
+    [self setupOfflineFallbackUI];
+
     if (![self refreshOutputDevices]) {
         return false;
     }
@@ -62,6 +70,8 @@ int onDevicesChanged(AudioObjectID inObjectID,
     if (![self setupListenerForCurrentAudioDevices]) {
         return false;
     }
+
+    [self startRefreshTimer];
     
     [self.bufferSizeComboBox selectItemWithObjectValue:[self currentOutputDeviceBufferFrameSize]];
     self.deviceNameTextField.enabled = YES;
@@ -73,6 +83,11 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.hideWhenUnavailableCheckbox.enabled = YES;
     self.hideWhenUnavailableCheckbox.state =
         [self currentHideWhenUnavailable] ? NSControlStateValueOn : NSControlStateValueOff;
+    if (self.offlineFallbackCheckbox) {
+        self.offlineFallbackCheckbox.enabled = YES;
+        self.offlineFallbackCheckbox.state =
+            [self currentOfflineFallback] ? NSControlStateValueOn : NSControlStateValueOff;
+    }
 
     ProxyAudioDevice::ActiveCondition condition = [self currentOutputDeviceActiveCondition];
 
@@ -165,34 +180,135 @@ int onDevicesChanged(AudioObjectID inObjectID,
                                (__bridge_retained CFStringRef)[NSString stringWithFormat:@"deviceName=%@", newName]);
 }
 
-- (AudioDeviceID)currentOutputDevice {
+- (NSString *)readConfigValueForType:(ProxyAudioDevice::ConfigType)type {
     AudioDeviceID proxyAudioBox = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
-    AudioDevice::setIdentifyValue(proxyAudioBox, -((SInt32)ProxyAudioDevice::ConfigType::outputDevice));
-    NSString *outputDeviceUID = (__bridge_transfer NSString *)AudioDevice::copyObjectName(proxyAudioBox);
-    
-    return AudioDevice::audioDeviceIDForDeviceUID((__bridge_retained CFStringRef)outputDeviceUID);
+    AudioDevice::setIdentifyValue(proxyAudioBox, -((SInt32)type));
+    return (__bridge_transfer NSString *)AudioDevice::copyObjectName(proxyAudioBox);
+}
+
+- (void)writeConfigString:(NSString *)keyValue {
+    AudioDeviceID proxyAudioBox = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
+    AudioDevice::setObjectName(proxyAudioBox, (__bridge CFStringRef)keyValue);
+}
+
+- (NSString *)currentOutputDeviceUID {
+    NSString *uid = [self readConfigValueForType:ProxyAudioDevice::ConfigType::outputDevice];
+    return uid.length > 0 ? uid : nil;
+}
+
+- (NSString *)currentOutputDeviceDisplayName {
+    NSString *name = [self readConfigValueForType:ProxyAudioDevice::ConfigType::outputDeviceDisplayName];
+    if (name.length > 0) {
+        return name;
+    }
+
+    NSString *uid = [self currentOutputDeviceUID];
+    if (uid.length == 0) {
+        return nil;
+    }
+
+    NSDictionary *cache = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDeviceNameCacheKey];
+    NSString *cached = cache[uid];
+    return cached.length > 0 ? cached : uid;
+}
+
+- (void)cacheName:(NSString *)name forUID:(NSString *)uid {
+    if (name.length == 0 || uid.length == 0) {
+        return;
+    }
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary *cache = [([defaults dictionaryForKey:kDeviceNameCacheKey] ?: @{}) mutableCopy];
+    if ([cache[uid] isEqualToString:name]) {
+        return;
+    }
+
+    cache[uid] = name;
+    [defaults setObject:cache forKey:kDeviceNameCacheKey];
+}
+
+- (AudioDeviceID)currentOutputDevice {
+    NSString *outputDeviceUID = [self currentOutputDeviceUID];
+    if (outputDeviceUID.length == 0) {
+        return kAudioObjectUnknown;
+    }
+
+    return AudioDevice::audioDeviceIDForDeviceUID((__bridge CFStringRef)outputDeviceUID);
+}
+
+- (void)startRefreshTimer {
+    if (refreshTimer) {
+        return;
+    }
+
+    refreshTimer = [NSTimer scheduledTimerWithTimeInterval:1.5
+                                                    target:self
+                                                  selector:@selector(pollRefresh)
+                                                  userInfo:nil
+                                                   repeats:YES];
+}
+
+- (void)pollRefresh {
+    if (self.outputDeviceComboBox.window.isVisible) {
+        [self refreshOutputDevices];
+    }
+}
+
+- (NSString *)currentDeviceListSignature {
+    NSString *storedUID = [self currentOutputDeviceUID] ?: @"";
+    NSMutableString *signature = [NSMutableString stringWithFormat:@"%@;", storedUID];
+    std::vector<AudioDeviceID> devices = AudioDevice::devicesWithOutputCapabilitiesThatAreNotProxyAudioDevice();
+
+    for (AudioDeviceID device : devices) {
+        NSString *uid = (__bridge_transfer NSString *)AudioDevice::copyDeviceUID(device);
+        [signature appendFormat:@"%@;", uid ?: @""];
+    }
+
+    return signature;
 }
 
 - (bool)refreshOutputDevices {
+    NSString *signature = [self currentDeviceListSignature];
+    if ([signature isEqualToString:lastDeviceListSignature] && self.outputDeviceComboBox.numberOfItems > 0) {
+        return true;
+    }
+    lastDeviceListSignature = signature;
+
     bool success = false;
     [self.outputDeviceComboBox removeAllItems];
     currentDeviceList = AudioDevice::devicesWithOutputCapabilitiesThatAreNotProxyAudioDevice();
-    AudioDeviceID outputDevice = [self currentOutputDevice];
+    NSString *storedUID = [self currentOutputDeviceUID];
+    bool foundStoredDevice = false;
     
     for (unsigned int i = 0; i < currentDeviceList.size(); ++i) {
         NSString *deviceName = (__bridge_transfer NSString *)AudioDevice::copyObjectName(currentDeviceList[i]);
+        NSString *uid = (__bridge_transfer NSString *)AudioDevice::copyDeviceUID(currentDeviceList[i]);
         
         if (!deviceName) {
             NSLog(@"Note: got null device name for audio device with device with ID: %d", currentDeviceList[i]);
             continue;
         }
+
+        if (uid.length > 0) {
+            [self cacheName:deviceName forUID:uid];
+        }
         
         [self.outputDeviceComboBox addItemWithObjectValue:deviceName];
         
-        if (outputDevice == currentDeviceList[i]) {
+        if (storedUID.length > 0 && [uid isEqualToString:storedUID]) {
             [self.outputDeviceComboBox selectItemAtIndex:i];
+            foundStoredDevice = true;
         }
         
+        success = true;
+    }
+
+    if (!foundStoredDevice && storedUID.length > 0) {
+        NSString *displayName = [self currentOutputDeviceDisplayName] ?: storedUID;
+        NSString *offlineName = [NSString stringWithFormat:NSLocalizedString(@"%@（离线）", nil), displayName];
+        [self.outputDeviceComboBox addItemWithObjectValue:offlineName];
+        currentDeviceList.push_back(kAudioObjectUnknown);
+        [self.outputDeviceComboBox selectItemAtIndex:(NSInteger)currentDeviceList.size() - 1];
         success = true;
     }
     
@@ -212,6 +328,10 @@ int onDevicesChanged(AudioObjectID inObjectID,
         return;
     }
 
+    if (currentDeviceList[index] == kAudioObjectUnknown) {
+        return;
+    }
+
     NSString *uid = (__bridge_transfer NSString *)AudioDevice::copyDeviceUID(currentDeviceList[index]);
     
     if (!uid) {
@@ -219,9 +339,9 @@ int onDevicesChanged(AudioObjectID inObjectID,
         return;
     }
 
-    AudioDeviceID proxyAudioBox = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
-    AudioDevice::setObjectName(proxyAudioBox,
-                               (__bridge_retained CFStringRef)[NSString stringWithFormat:@"outputDevice=%@", uid]);
+    [self writeConfigString:[NSString stringWithFormat:@"outputDevice=%@", uid]];
+    lastDeviceListSignature = nil;
+    [self refreshOutputDevices];
 }
 
 - (NSString *)currentOutputDeviceBufferFrameSize {
@@ -306,6 +426,57 @@ int onDevicesChanged(AudioObjectID inObjectID,
 - (IBAction)hideWhenUnavailableToggled:(id)sender {
     #pragma unused(sender)
     [self setCurrentHideWhenUnavailable:(self.hideWhenUnavailableCheckbox.state == NSControlStateValueOn)];
+}
+
+- (bool)currentOfflineFallback {
+    NSString *result = [self readConfigValueForType:ProxyAudioDevice::ConfigType::outputDeviceOfflineFallback];
+    return [result intValue] != 0;
+}
+
+- (void)setCurrentOfflineFallback:(bool)fallBackToSpeakers {
+    [self writeConfigString:[NSString stringWithFormat:@"outputDeviceOfflineFallback=%d", fallBackToSpeakers ? 1 : 0]];
+}
+
+- (IBAction)offlineFallbackToggled:(id)sender {
+#pragma unused(sender)
+    [self setCurrentOfflineFallback:(self.offlineFallbackCheckbox.state == NSControlStateValueOn)];
+}
+
+- (void)setupOfflineFallbackUI {
+    if (offlineFallbackUIBuilt) {
+        return;
+    }
+
+    NSWindow *window = self.deviceNameTextField.window;
+    NSView *contentView = window.contentView;
+    if (!window || !contentView) {
+        return;
+    }
+
+    const CGFloat extraHeight = 28.0;
+    NSRect frame = window.frame;
+    frame.size.height += extraHeight;
+    [window setFrame:frame display:YES];
+
+    NSSize maxSize = window.contentMaxSize;
+    NSSize minSize = window.contentMinSize;
+    maxSize.height += extraHeight;
+    minSize.height += extraHeight;
+    window.contentMaxSize = maxSize;
+    window.contentMinSize = minSize;
+
+    NSButton *checkbox = [[NSButton alloc] initWithFrame:NSZeroRect];
+    [checkbox setButtonType:NSButtonTypeSwitch];
+    checkbox.title = NSLocalizedString(@"LG C3 离线时回退到 Mac mini 扬声器（默认静音）", nil);
+    checkbox.target = self;
+    checkbox.action = @selector(offlineFallbackToggled:);
+    checkbox.frame = NSMakeRect(157.0, 20.0, 336.0, 18.0);
+    checkbox.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+    checkbox.enabled = NO;
+    [contentView addSubview:checkbox];
+    self.offlineFallbackCheckbox = checkbox;
+
+    offlineFallbackUIBuilt = true;
 }
 
 @end

@@ -10,6 +10,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, strong) IBOutlet NSButton *userIsActiveRadioButton;
 @property(nonatomic, strong) IBOutlet NSButton *alwaysRadioButton;
 @property(nonatomic, strong) IBOutlet NSButton *hideWhenUnavailableCheckbox;
+@property(nonatomic, strong) NSButton *offlineFallbackCheckbox;
 
 - (void)awakeFromNib;
 - (IBAction)deviceNameEntered:(id)sender;
@@ -19,6 +20,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (IBAction)userIsActiveConditionSelected:(id)sender;
 - (IBAction)alwaysConditionSelected:(id)sender;
 - (IBAction)hideWhenUnavailableToggled:(id)sender;
+- (IBAction)offlineFallbackToggled:(id)sender;
 
 @end
 
