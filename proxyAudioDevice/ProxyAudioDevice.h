@@ -3,6 +3,7 @@
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreAudio/CoreAudio.h>
+#include <dispatch/dispatch.h>
 #include <vector>
 #include <atomic>
 
@@ -32,6 +33,7 @@ enum {
 // Default to false so the proxy device stays visible even when the target is
 // unavailable. This preserves the long-standing behavior for existing users.
 #define kOutputDeviceDefaultHideWhenUnavailable false
+#define kOutputDeviceDefaultOfflineFallback false
 
 class ProxyAudioDevice {
   public:
@@ -41,12 +43,17 @@ class ProxyAudioDevice {
         outputDeviceBufferFrameSize,
         deviceName,
         deviceActiveCondition,
-        deviceHideWhenUnavailable
+        deviceHideWhenUnavailable,
+        outputDeviceOfflineFallback,
+        outputDeviceDisplayName
     };
     enum class ActiveCondition { proxiedDeviceActive = 0, userActive = 1, always = 2 };
 
     ProxyAudioDevice() : inputIOIsActive(false) {};
     AudioDevice findTargetOutputAudioDevice();
+    AudioDevice findPreferredOutputAudioDevice();
+    AudioDevice findFallbackOutputAudioDevice();
+    AudioDevice findBuiltInSpeakerDevice();
     static int outputDeviceAliveListenerStatic(AudioObjectID inObjectID,
                                                UInt32 inNumberAddresses,
                                                const AudioObjectPropertyAddress *inAddresses,
@@ -73,6 +80,8 @@ class ProxyAudioDevice {
                             const AudioObjectPropertyAddress *inAddresses);
     void setupAudioDevicesListener();
     void setupTargetOutputDevice();
+    void scheduleTargetDeviceRetry(int generation);
+    void startTargetDeviceWatchdog();
     void initializeOutputDevice();
     void deinitializeOutputDeviceNoLock();
     void deinitializeOutputDevice();
@@ -103,13 +112,21 @@ class ProxyAudioDevice {
     void setDeviceName(CFStringRef newName);
     CFStringRef copyDefaultProxyOutputDeviceUID();
     CFStringRef copyOutputDeviceUIDFromStorage();
+    CFStringRef copyOutputDeviceNameFromStorage();
+    CFStringRef copyOutputDeviceManufacturerFromStorage();
+    UInt32 retrieveOutputDeviceTransportTypeFromStorage();
+    void captureTargetIdentity(AudioObjectID device);
+    void persistCapturedTargetIdentity();
     void setOutputDevice(CFStringRef deviceUID);
+    void updateStoredOutputDeviceUID(CFStringRef deviceUID);
     UInt32 retrieveOutputDeviceBufferFrameSizeFromStorage();
     void setOutputDeviceBufferFrameSize(UInt32 size);
     ActiveCondition retrieveOutputDeviceActiveConditionFromStorage();
     void setOutputDeviceActiveCondition(ActiveCondition newActiveCondition);
     bool retrieveOutputDeviceHideWhenUnavailableFromStorage();
     void setOutputDeviceHideWhenUnavailable(bool newHideWhenUnavailable);
+    bool retrieveOutputDeviceOfflineFallbackFromStorage();
+    void setOutputDeviceOfflineFallback(bool fallBackToSpeakers);
     void notifyHiddenPropertyChanged();
 
     static ProxyAudioDevice *deviceForDriver(void *inDriver);
@@ -505,6 +522,12 @@ class ProxyAudioDevice {
     CFStringRef deviceName = NULL;
     CFStringRef boxName = NULL;
     CFStringRef outputDeviceUID = NULL;
+    CFStringRef outputDeviceName = NULL;
+    CFStringRef outputDeviceManufacturer = NULL;
+    UInt32 outputDeviceTransportType = 0;
+    bool outputDeviceOfflineFallback = kOutputDeviceDefaultOfflineFallback;
+    std::atomic<int> targetDeviceSearchGeneration{0};
+    dispatch_source_t targetDeviceWatchdogTimer = NULL;
     UInt32 outputDeviceBufferFrameSize = kOutputDeviceDefaultBufferFrameSize;
     SInt64 smallestFramesToBufferEnd = -1;
     Float64 outputAccumulatedRateRatio = 0.0;

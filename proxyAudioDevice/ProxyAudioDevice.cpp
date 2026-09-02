@@ -35,6 +35,124 @@ std::string CFStringToStdString(CFStringRef s) {
     return result;
 }
 
+static std::vector<std::string> splitOnColon(const std::string &s) {
+    std::vector<std::string> result;
+    size_t start = 0;
+    size_t pos;
+    while ((pos = s.find(':', start)) != std::string::npos) {
+        result.push_back(s.substr(start, pos - start));
+        start = pos + 1;
+    }
+    result.push_back(s.substr(start));
+    return result;
+}
+
+static bool isSameUSBDeviceDifferentPort(CFStringRef target, CFStringRef candidate) {
+    if (!target || !candidate) {
+        return false;
+    }
+
+    std::vector<std::string> t = splitOnColon(CFStringToStdString(target));
+    std::vector<std::string> c = splitOnColon(CFStringToStdString(candidate));
+    if (t.size() != 5 || c.size() != 5) {
+        return false;
+    }
+    if (t[0] != "AppleUSBAudioEngine" || c[0] != "AppleUSBAudioEngine") {
+        return false;
+    }
+    if (t[1] != c[1] || t[2] != c[2] || t[4] != c[4]) {
+        return false;
+    }
+    return true;
+}
+
+static bool deviceIsAlive(AudioObjectID device) {
+    if (device == kAudioObjectUnknown) {
+        return false;
+    }
+
+    AudioObjectPropertyAddress aliveAddress = {
+        kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+    UInt32 alive = 0;
+    UInt32 size = sizeof(alive);
+    OSStatus err = AudioObjectGetPropertyData(device, &aliveAddress, 0, NULL, &size, &alive);
+    return (err == noErr && alive == 1);
+}
+
+static bool deviceHasStereoOutput(AudioObjectID device) {
+    UInt32 values[2];
+    AudioObjectPropertyAddress propertyAddress = {kAudioDevicePropertyPreferredChannelsForStereo,
+                                                  kAudioObjectPropertyScopeOutput,
+                                                  kAudioObjectPropertyElementMaster};
+    UInt32 size = sizeof(values);
+    OSStatus error = AudioObjectGetPropertyData(device, &propertyAddress, 0, NULL, &size, values);
+    return (error == noErr && values[0] != values[1]);
+}
+
+static UInt32 copyDeviceTransportType(AudioObjectID device) {
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+    UInt32 transport = 0;
+    UInt32 size = sizeof(transport);
+    OSStatus err = AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &transport);
+    return (err == noErr) ? transport : 0;
+}
+
+static CFStringRef copyDeviceManufacturer(AudioObjectID device) {
+    if (device == kAudioObjectUnknown) {
+        return nullptr;
+    }
+
+    AudioObjectPropertyAddress address = {
+        kAudioObjectPropertyManufacturer, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+    CFStringRef manufacturer = NULL;
+    UInt32 size = sizeof(manufacturer);
+    OSStatus err = AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &manufacturer);
+    return (err == noErr) ? manufacturer : nullptr;
+}
+
+static bool isHDMIFamilyTransport(UInt32 transport) {
+    return transport == kAudioDeviceTransportTypeHDMI || transport == kAudioDeviceTransportTypeDisplayPort;
+}
+
+static bool transportFamilyMatches(UInt32 a, UInt32 b) {
+    if (a == 0 || b == 0) {
+        return true;
+    }
+    if (a == b) {
+        return true;
+    }
+    return isHDMIFamilyTransport(a) && isHDMIFamilyTransport(b);
+}
+
+static bool stringsEqualIfPresent(CFStringRef a, CFStringRef b) {
+    if (!a || CFStringGetLength(a) == 0 || !b || CFStringGetLength(b) == 0) {
+        return true;
+    }
+    return CFStringCompare(a, b, 0) == kCFCompareEqualTo;
+}
+
+static bool isStrictIdentityMatch(CFStringRef targetName,
+                                  CFStringRef targetManufacturer,
+                                  UInt32 targetTransport,
+                                  CFStringRef candidateName,
+                                  CFStringRef candidateManufacturer,
+                                  UInt32 candidateTransport) {
+    if (!targetName || !candidateName || CFStringGetLength(targetName) == 0 || CFStringGetLength(candidateName) == 0) {
+        return false;
+    }
+    if (CFStringCompare(targetName, candidateName, 0) != kCFCompareEqualTo) {
+        return false;
+    }
+    if (!transportFamilyMatches(targetTransport, candidateTransport)) {
+        return false;
+    }
+    if (!stringsEqualIfPresent(targetManufacturer, candidateManufacturer)) {
+        return false;
+    }
+    return true;
+}
+
 #pragma mark The Interface
 
 static AudioServerPlugInDriverInterface gAudioServerPlugInDriverInterface = {
@@ -568,9 +686,14 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     
     deviceName = copyDeviceNameFromStorage();
     outputDeviceUID = copyOutputDeviceUIDFromStorage();
+    outputDeviceName = copyOutputDeviceNameFromStorage();
+    outputDeviceManufacturer = copyOutputDeviceManufacturerFromStorage();
+    outputDeviceTransportType = retrieveOutputDeviceTransportTypeFromStorage();
     outputDeviceBufferFrameSize = retrieveOutputDeviceBufferFrameSizeFromStorage();
     outputDeviceActiveCondition = retrieveOutputDeviceActiveConditionFromStorage();
     outputDeviceHideWhenUnavailable = retrieveOutputDeviceHideWhenUnavailableFromStorage();
+    outputDeviceOfflineFallback = retrieveOutputDeviceOfflineFallbackFromStorage();
+    startTargetDeviceWatchdog();
 
     //    calculate the host ticks per frame
     struct mach_timebase_info theTimeBaseInfo;
@@ -4661,43 +4784,159 @@ Done:
 
 #pragma mark Output Device Operations
 
-AudioDevice ProxyAudioDevice::findTargetOutputAudioDevice() {
-    DebugMsg("ProxyAudio: findTargetOutputAudioDevice");
-    std::vector<AudioObjectID> devices = AudioDevice::allAudioDevices();
+AudioDevice ProxyAudioDevice::findPreferredOutputAudioDevice() {
+    DebugMsg("ProxyAudio: findPreferredOutputAudioDevice");
     CFStringSmartRef currentOutputDeviceUID;
-    
+    CFStringSmartRef currentOutputDeviceName;
+    CFStringSmartRef currentOutputDeviceManufacturer;
+    UInt32 currentTransportType = 0;
+
     {
         CAMutex::Locker locker(&stateMutex);
-        
+
         if (!outputDeviceUID) {
-            DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, output device UID is null");
+            DebugMsg("ProxyAudio: findPreferredOutputAudioDevice finished, output device UID is null");
             return AudioDevice();
         }
-        
+
         currentOutputDeviceUID = CFStringCreateCopy(NULL, outputDeviceUID);
+        if (outputDeviceName) {
+            currentOutputDeviceName = CFStringCreateCopy(NULL, outputDeviceName);
+        }
+        if (outputDeviceManufacturer) {
+            currentOutputDeviceManufacturer = CFStringCreateCopy(NULL, outputDeviceManufacturer);
+        }
+        currentTransportType = outputDeviceTransportType;
     }
-    
-    DebugMsg("ProxyAudio: findTargetOutputAudioDevice target UID: %s", CFStringToStdString(currentOutputDeviceUID).c_str());
-    
+
+    DebugMsg("ProxyAudio: findPreferredOutputAudioDevice target UID: %s",
+             CFStringToStdString(currentOutputDeviceUID).c_str());
+
+    std::vector<AudioObjectID> devices = AudioDevice::allAudioDevices();
+    AudioObjectID exactMatch = kAudioObjectUnknown;
+    AudioObjectID identityMatch = kAudioObjectUnknown;
+    int identityMatchCount = 0;
+    AudioObjectID usbPortMatch = kAudioObjectUnknown;
+
     for (AudioObjectID device : devices) {
-        AudioObjectPropertyAddress propertyAddress = {
-            kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMaster};
+        CFStringSmartRef uid = AudioDevice::copyDeviceUID(device);
 
-        CFStringSmartRef uid;
-        UInt32 size = sizeof(CFStringRef);
-        OSStatus err = AudioObjectGetPropertyData(device, &propertyAddress, 0, NULL, &size, &uid);
+        if (!uid || CFStringCompare(uid, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo) {
+            continue;
+        }
 
-        if (err == noErr && uid) {
-            if (CFStringCompare(uid, currentOutputDeviceUID, 0) == kCFCompareEqualTo) {
-                DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, found output device");
-                return AudioDevice(device);
+        if (!deviceHasStereoOutput(device) || !deviceIsAlive(device)) {
+            continue;
+        }
+
+        if (CFStringCompare(uid, currentOutputDeviceUID, 0) == kCFCompareEqualTo) {
+            exactMatch = device;
+            break;
+        }
+
+        CFStringSmartRef name = AudioDevice::copyObjectName(device);
+        CFStringSmartRef manufacturer = copyDeviceManufacturer(device);
+        UInt32 transport = copyDeviceTransportType(device);
+
+        if (isStrictIdentityMatch(currentOutputDeviceName,
+                                  currentOutputDeviceManufacturer,
+                                  currentTransportType,
+                                  name,
+                                  manufacturer,
+                                  transport)) {
+            identityMatchCount += 1;
+            if (identityMatchCount == 1) {
+                identityMatch = device;
+            } else {
+                identityMatch = kAudioObjectUnknown;
             }
+        }
+
+        if (usbPortMatch == kAudioObjectUnknown && isSameUSBDeviceDifferentPort(currentOutputDeviceUID, uid)) {
+            usbPortMatch = device;
         }
     }
 
-    DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, not not find output device");
-    
+    if (exactMatch != kAudioObjectUnknown) {
+        DebugMsg("ProxyAudio: findPreferredOutputAudioDevice finished, exact UID match");
+        return AudioDevice(exactMatch);
+    }
+
+    if (identityMatch != kAudioObjectUnknown && identityMatchCount == 1) {
+        CFStringSmartRef matchedUID = AudioDevice::copyDeviceUID(identityMatch);
+        DebugMsg("ProxyAudio: findPreferredOutputAudioDevice finished, unique identity match");
+        if (matchedUID) {
+            updateStoredOutputDeviceUID(matchedUID);
+        }
+        return AudioDevice(identityMatch);
+    }
+
+    if (usbPortMatch != kAudioObjectUnknown) {
+        DebugMsg("ProxyAudio: findPreferredOutputAudioDevice finished, USB port-swap match");
+        return AudioDevice(usbPortMatch);
+    }
+
+    DebugMsg("ProxyAudio: findPreferredOutputAudioDevice finished, did not find preferred device");
     return AudioDevice();
+}
+
+AudioDevice ProxyAudioDevice::findBuiltInSpeakerDevice() {
+    std::vector<AudioObjectID> devices = AudioDevice::allAudioDevices();
+    AudioObjectID builtInSpeaker = kAudioObjectUnknown;
+
+    for (AudioObjectID device : devices) {
+        CFStringSmartRef uid = AudioDevice::copyDeviceUID(device);
+
+        if (!uid || CFStringCompare(uid, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo) {
+            continue;
+        }
+
+        if (!deviceHasStereoOutput(device) || !deviceIsAlive(device)) {
+            continue;
+        }
+
+        if (copyDeviceTransportType(device) != kAudioDeviceTransportTypeBuiltIn) {
+            continue;
+        }
+
+        if (CFStringCompare(uid, CFSTR("BuiltInSpeakerDevice"), 0) == kCFCompareEqualTo) {
+            return AudioDevice(device);
+        }
+
+        if (builtInSpeaker == kAudioObjectUnknown) {
+            builtInSpeaker = device;
+        }
+    }
+
+    if (builtInSpeaker != kAudioObjectUnknown) {
+        return AudioDevice(builtInSpeaker);
+    }
+
+    return AudioDevice();
+}
+
+AudioDevice ProxyAudioDevice::findFallbackOutputAudioDevice() {
+    bool fallBackToSpeakers = false;
+    {
+        CAMutex::Locker locker(&stateMutex);
+        fallBackToSpeakers = outputDeviceOfflineFallback;
+    }
+
+    if (!fallBackToSpeakers) {
+        DebugMsg("ProxyAudio: findFallbackOutputAudioDevice mute (no fallback device)");
+        return AudioDevice();
+    }
+
+    DebugMsg("ProxyAudio: findFallbackOutputAudioDevice using built-in speakers");
+    return findBuiltInSpeakerDevice();
+}
+
+AudioDevice ProxyAudioDevice::findTargetOutputAudioDevice() {
+    AudioDevice preferred = findPreferredOutputAudioDevice();
+    if (preferred.isValid()) {
+        return preferred;
+    }
+    return findFallbackOutputAudioDevice();
 }
 
 int ProxyAudioDevice::outputDeviceAliveListenerStatic(AudioObjectID inObjectID,
@@ -4719,19 +4958,9 @@ int ProxyAudioDevice::outputDeviceAliveListener(AudioObjectID inObjectID,
 #pragma unused(inAddresses)
 
     DebugMsg("ProxyAudio: outputDeviceAliveListener");
-    {
-        CAMutex::Locker locker(outputDeviceMutex);
-        UInt32 alive = 0;
-        OSStatus err = outputDevice.getIntegerPropertyData(
-            alive, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster);
-
-        if (err == noErr && alive == 1) {
-            return noErr;
-        }
-    }
-
-    DebugMsg("ProxyAudio: outputDeviceAliveListener output device no longer alive");
-    deinitializeOutputDevice();
+    ExecuteInAudioOutputThread(^() {
+        setupTargetOutputDevice();
+    });
 
     return noErr;
 }
@@ -4778,7 +5007,9 @@ int ProxyAudioDevice::devicesListenerProc(AudioObjectID inObjectID,
 #pragma unused(inNumberAddresses)
 #pragma unused(inAddresses)
     DebugMsg("ProxyAudio: devicesListenerProc current devices changed");
-    setupTargetOutputDevice();
+    ExecuteInAudioOutputThread(^() {
+        setupTargetOutputDevice();
+    });
     return noErr;
 }
 
@@ -4889,14 +5120,22 @@ void ProxyAudioDevice::matchOutputDeviceSampleRate()
 
 void ProxyAudioDevice::setupTargetOutputDevice() {
     DebugMsg("ProxyAudio: setupTargetOutputDevice");
-    AudioDevice newOutputDevice = findTargetOutputAudioDevice();
+    int generation = ++targetDeviceSearchGeneration;
 
-    DebugMsg("ProxyAudio: setupTargetOutputDevice newOutputDevice: %d", newOutputDevice.id);
+    AudioDevice preferredDevice = findPreferredOutputAudioDevice();
+    AudioDevice newOutputDevice = preferredDevice.isValid() ? preferredDevice : findFallbackOutputAudioDevice();
+
+    DebugMsg("ProxyAudio: setupTargetOutputDevice newOutputDevice: %d preferred: %d",
+             newOutputDevice.id,
+             preferredDevice.id);
     CAMutex::Locker locker(outputDeviceMutex);
-    
+
     if (outputDevice.isValid() && outputDevice.id == newOutputDevice.id
         && outputDevice.bufferFrameSize == outputDeviceBufferFrameSize) {
         DebugMsg("ProxyAudio: setupTargetOutputDevice no change in device");
+        if (!preferredDevice.isValid()) {
+            scheduleTargetDeviceRetry(generation);
+        }
         return;
     }
 
@@ -4924,9 +5163,48 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
                                          this);
         DebugMsg("ProxyAudio: setupTargetOutputDevice will match sample rate");
         matchOutputDeviceSampleRateNoLock();
+        if (preferredDevice.isValid() && preferredDevice.id == newOutputDevice.id) {
+            captureTargetIdentity(newOutputDevice.id);
+        }
     } else {
         syslog(LOG_WARNING, "ProxyAudio: setupTargetOutputDevice could not find output device");
     }
+
+    if (!preferredDevice.isValid()) {
+        scheduleTargetDeviceRetry(generation);
+    }
+}
+
+static const uint64_t kTargetDeviceRetryIntervalNs = 5ull * NSEC_PER_SEC;
+
+void ProxyAudioDevice::scheduleTargetDeviceRetry(int generation) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kTargetDeviceRetryIntervalNs),
+                   AudioOutputDispatchQueue(),
+                   ^() {
+                       if (generation != targetDeviceSearchGeneration.load()) {
+                           DebugMsg("ProxyAudio: target device retry skipped, generation stale");
+                           return;
+                       }
+                       DebugMsg("ProxyAudio: target device retry firing");
+                       setupTargetOutputDevice();
+                   });
+}
+
+void ProxyAudioDevice::startTargetDeviceWatchdog() {
+    if (targetDeviceWatchdogTimer) {
+        return;
+    }
+
+    targetDeviceWatchdogTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, AudioOutputDispatchQueue());
+    dispatch_source_set_timer(targetDeviceWatchdogTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, kTargetDeviceRetryIntervalNs),
+                              kTargetDeviceRetryIntervalNs,
+                              250ull * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(targetDeviceWatchdogTimer, ^{
+        DebugMsg("ProxyAudio: target device watchdog firing");
+        setupTargetOutputDevice();
+    });
+    dispatch_resume(targetDeviceWatchdogTimer);
 }
 
 void ProxyAudioDevice::initializeOutputDevice() {
@@ -5517,6 +5795,8 @@ void ProxyAudioDevice::parseConfigurationString(CFStringRef configString, Config
         action = ConfigType::deviceActiveCondition;
     } else if (CFStringCompare(actionString, CFSTR("outputDeviceHideWhenUnavailable"), 0) == kCFCompareEqualTo) {
         action = ConfigType::deviceHideWhenUnavailable;
+    } else if (CFStringCompare(actionString, CFSTR("outputDeviceOfflineFallback"), 0) == kCFCompareEqualTo) {
+        action = ConfigType::outputDeviceOfflineFallback;
     } else {
         return;
     }
@@ -5557,6 +5837,10 @@ void ProxyAudioDevice::setConfigurationValue(ConfigType type, CFStringRef value)
             setOutputDeviceHideWhenUnavailable(CFStringGetIntValue(value) != 0);
             break;
 
+        case ConfigType::outputDeviceOfflineFallback:
+            setOutputDeviceOfflineFallback(CFStringGetIntValue(value) != 0);
+            break;
+
         default:
             break;
     }
@@ -5580,6 +5864,15 @@ CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
 
         case ConfigType::deviceHideWhenUnavailable:
             return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceHideWhenUnavailable ? 1 : 0);
+
+        case ConfigType::outputDeviceOfflineFallback:
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceOfflineFallback ? 1 : 0);
+
+        case ConfigType::outputDeviceDisplayName:
+            if (outputDeviceName) {
+                return CFStringCreateCopy(NULL, outputDeviceName);
+            }
+            return CFStringCreateCopy(NULL, CFSTR(""));
 
         default:
             return nullptr;
@@ -5699,6 +5992,121 @@ CFStringRef ProxyAudioDevice::copyOutputDeviceUIDFromStorage() {
     return nullptr;
 }
 
+void ProxyAudioDevice::updateStoredOutputDeviceUID(CFStringRef deviceUID) {
+    if (!deviceUID || !gPlugIn_Host) {
+        return;
+    }
+
+    {
+        CAMutex::Locker locker(&stateMutex);
+        if (outputDeviceUID && CFStringCompare(outputDeviceUID, deviceUID, 0) == kCFCompareEqualTo) {
+            return;
+        }
+
+        if (outputDeviceUID) {
+            CFRelease(outputDeviceUID);
+        }
+
+        outputDeviceUID = CFStringCreateCopy(NULL, deviceUID);
+    }
+
+    ExecuteInAudioOutputThread(^{
+        CAMutex::Locker locker(&stateMutex);
+        if (outputDeviceUID) {
+            gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceUID"), outputDeviceUID);
+        }
+    });
+}
+
+CFStringRef ProxyAudioDevice::copyOutputDeviceNameFromStorage() {
+    if (!gPlugIn_Host) {
+        return nullptr;
+    }
+
+    CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceName"), &data);
+    if (data != NULL && CFGetTypeID(data) == CFStringGetTypeID()) {
+        return CFStringCreateCopy(NULL, CFStringRef(CFPropertyListRef(data)));
+    }
+    return nullptr;
+}
+
+CFStringRef ProxyAudioDevice::copyOutputDeviceManufacturerFromStorage() {
+    if (!gPlugIn_Host) {
+        return nullptr;
+    }
+
+    CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceManufacturer"), &data);
+    if (data != NULL && CFGetTypeID(data) == CFStringGetTypeID()) {
+        return CFStringCreateCopy(NULL, CFStringRef(CFPropertyListRef(data)));
+    }
+    return nullptr;
+}
+
+UInt32 ProxyAudioDevice::retrieveOutputDeviceTransportTypeFromStorage() {
+    if (!gPlugIn_Host) {
+        return 0;
+    }
+
+    CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceTransportType"), &data);
+    if (data == NULL || CFGetTypeID(data) != CFNumberGetTypeID()) {
+        return 0;
+    }
+
+    SInt32 value = 0;
+    CFNumberGetValue(CFNumberRef(CFPropertyListRef(data)), kCFNumberSInt32Type, &value);
+    return UInt32(value);
+}
+
+void ProxyAudioDevice::persistCapturedTargetIdentity() {
+    if (!gPlugIn_Host) {
+        return;
+    }
+
+    CAMutex::Locker locker(&stateMutex);
+    if (outputDeviceName) {
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceName"), outputDeviceName);
+    }
+    if (outputDeviceManufacturer) {
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceManufacturer"), outputDeviceManufacturer);
+    }
+    CFNumberSmartRef transportRef = CFNumberCreate(NULL, kCFNumberSInt32Type, &outputDeviceTransportType);
+    gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceTransportType"), transportRef);
+}
+
+void ProxyAudioDevice::captureTargetIdentity(AudioObjectID device) {
+    if (device == kAudioObjectUnknown) {
+        return;
+    }
+
+    CFStringSmartRef name = AudioDevice::copyObjectName(device);
+    CFStringSmartRef manufacturer = copyDeviceManufacturer(device);
+    UInt32 transport = copyDeviceTransportType(device);
+
+    {
+        CAMutex::Locker locker(&stateMutex);
+        if (outputDeviceName) {
+            CFRelease(outputDeviceName);
+            outputDeviceName = NULL;
+        }
+        if (outputDeviceManufacturer) {
+            CFRelease(outputDeviceManufacturer);
+            outputDeviceManufacturer = NULL;
+        }
+        if (name) {
+            outputDeviceName = CFStringCreateCopy(NULL, name);
+        }
+        if (manufacturer) {
+            outputDeviceManufacturer = CFStringCreateCopy(NULL, manufacturer);
+        }
+        outputDeviceTransportType = transport;
+    }
+
+    persistCapturedTargetIdentity();
+}
+
 void ProxyAudioDevice::setOutputDevice(CFStringRef deviceUID) {
     if (!gPlugIn_Host) {
         return;
@@ -5718,6 +6126,11 @@ void ProxyAudioDevice::setOutputDevice(CFStringRef deviceUID) {
         CAMutex::Locker locker(&stateMutex);
         gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceUID"), outputDeviceUID);
     });
+
+    AudioObjectID device = AudioDevice::audioDeviceIDForDeviceUID(deviceUID);
+    if (device != kAudioObjectUnknown) {
+        captureTargetIdentity(device);
+    }
     
     ExecuteInAudioOutputThread(^{
         setupTargetOutputDevice();
@@ -5831,6 +6244,39 @@ void ProxyAudioDevice::setOutputDeviceHideWhenUnavailable(bool newHideWhenUnavai
     // re-query kAudioDevicePropertyIsHidden immediately instead of waiting for
     // the next device-availability transition.
     notifyHiddenPropertyChanged();
+}
+
+bool ProxyAudioDevice::retrieveOutputDeviceOfflineFallbackFromStorage() {
+    DebugMsg("ProxyAudio: retrieveOutputDeviceOfflineFallbackFromStorage");
+
+    if (!gPlugIn_Host) {
+        DebugMsg("ProxyAudio: retrieveOutputDeviceOfflineFallbackFromStorage no plugin host");
+        return kOutputDeviceDefaultOfflineFallback;
+    }
+
+    CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceOfflineFallback"), &data);
+
+    if (data == NULL || CFGetTypeID(data) != CFBooleanGetTypeID()) {
+        DebugMsg("ProxyAudio: retrieveOutputDeviceOfflineFallbackFromStorage finished returning default value");
+        return kOutputDeviceDefaultOfflineFallback;
+    }
+
+    return CFBooleanGetValue(CFBooleanRef(CFPropertyListRef(data)));
+}
+
+void ProxyAudioDevice::setOutputDeviceOfflineFallback(bool fallBackToSpeakers) {
+    {
+        CAMutex::Locker locker(&stateMutex);
+        outputDeviceOfflineFallback = fallBackToSpeakers;
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host,
+                                     CFSTR("outputDeviceOfflineFallback"),
+                                     fallBackToSpeakers ? kCFBooleanTrue : kCFBooleanFalse);
+    }
+
+    ExecuteInAudioOutputThread(^() {
+        setupTargetOutputDevice();
+    });
 }
 
 // Tell the host to re-read kAudioDevicePropertyIsHidden. We always notify,
