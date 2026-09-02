@@ -19,6 +19,9 @@ static NSString *const kHALDriverPath = @"/Library/Audio/Plug-Ins/HAL/ProxyAudio
     NSString *lastDeviceListSignature;
     bool nativeUIBuilt;
     bool audioListenerInstalled;
+    NSView *advancedContainer;
+    NSTextField *activityCaptionLabel;
+    NSButton *advancedToggle;
 }
 
 - (void)awakeFromNib {
@@ -132,9 +135,8 @@ int onDevicesChanged(AudioObjectID inObjectID,
     NSWindow *window = self.window;
     window.title = @"Proxy Audio";
     window.styleMask |= NSWindowStyleMaskResizable;
-    window.contentMinSize = NSMakeSize(400, 380);
-    window.contentMaxSize = NSMakeSize(900, 1200);
-    window.titlebarAppearsTransparent = NO;
+    window.contentMinSize = NSMakeSize(380, 320);
+    window.contentMaxSize = NSMakeSize(720, 900);
 
     NSView *content = [[NSView alloc] initWithFrame:NSZeroRect];
     window.contentView = content;
@@ -142,72 +144,97 @@ int onDevicesChanged(AudioObjectID inObjectID,
     NSStackView *root = [[NSStackView alloc] init];
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
     root.alignment = NSLayoutAttributeLeading;
-    root.spacing = 16;
+    root.spacing = 14;
     root.translatesAutoresizingMaskIntoConstraints = NO;
     [content addSubview:root];
 
     [NSLayoutConstraint activateConstraints:@[
-        [root.topAnchor constraintEqualToAnchor:content.topAnchor constant:20],
-        [root.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:20],
-        [root.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-20],
-        [root.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-20],
+        [root.topAnchor constraintEqualToAnchor:content.topAnchor constant:18],
+        [root.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:18],
+        [root.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-18],
+        [root.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-18],
     ]];
 
-    NSView *statusRow = [self makeDriverStatusRow];
-    NSView *outputForm = [self makeOutputForm];
-    NSView *activeGroup = [self makeActiveConditionGroup];
-    NSView *soundLink = [self makeSoundSettingsLink];
+    NSView *statusCard = [self cardWithTitle:nil content:[self makeDriverStatusRow]];
+    NSView *outputCard = [self cardWithTitle:@"输出" content:[self makeOutputForm]];
+    NSView *activeCard = [self cardWithTitle:@"保持工作" content:[self makeActiveConditionGroup]];
+    NSView *advancedCard = [self cardWithTitle:nil content:[self makeAdvancedForm]];
+    advancedContainer = advancedCard;
+    advancedContainer.hidden = YES;
 
-    [root addArrangedSubview:statusRow];
-    [root addArrangedSubview:[self separator]];
+    [root addArrangedSubview:statusCard];
 
     self.settingsContainer = [[NSStackView alloc] init];
     NSStackView *settings = (NSStackView *)self.settingsContainer;
     settings.orientation = NSUserInterfaceLayoutOrientationVertical;
     settings.alignment = NSLayoutAttributeLeading;
-    settings.spacing = 16;
+    settings.spacing = 14;
     settings.translatesAutoresizingMaskIntoConstraints = NO;
     [root addArrangedSubview:settings];
 
-    [settings addArrangedSubview:[self makeSectionLabel:@"输出"]];
-    [settings addArrangedSubview:outputForm];
-    [settings addArrangedSubview:soundLink];
-    [settings addArrangedSubview:[self separator]];
-    [settings addArrangedSubview:[self makeSectionLabel:@"保持工作"]];
-    [settings addArrangedSubview:activeGroup];
+    [settings addArrangedSubview:outputCard];
+    [settings addArrangedSubview:activeCard];
+    [settings addArrangedSubview:[self makeAdvancedToggle]];
+    [settings addArrangedSubview:advancedCard];
 
     [NSLayoutConstraint activateConstraints:@[
-        [statusRow.widthAnchor constraintEqualToAnchor:root.widthAnchor],
+        [statusCard.widthAnchor constraintEqualToAnchor:root.widthAnchor],
         [settings.widthAnchor constraintEqualToAnchor:root.widthAnchor],
-        [outputForm.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
-        [activeGroup.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
+        [outputCard.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
+        [activeCard.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
+        [advancedCard.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
     ]];
 
-    [content layoutSubtreeIfNeeded];
-    NSSize fitting = root.fittingSize;
-    fitting.width += 40;
-    fitting.height += 40;
-    fitting.width = MAX(fitting.width, 440);
-    [window setContentSize:fitting];
-
+    [self sizeWindowToFit];
     nativeUIBuilt = true;
 }
 
-- (NSView *)separator {
-    NSBox *line = [[NSBox alloc] init];
-    line.boxType = NSBoxSeparator;
-    line.translatesAutoresizingMaskIntoConstraints = NO;
-    [line.heightAnchor constraintEqualToConstant:1].active = YES;
-    [line.widthAnchor constraintGreaterThanOrEqualToConstant:400].active = YES;
-    return line;
+- (void)sizeWindowToFit {
+    [self.window.contentView layoutSubtreeIfNeeded];
+    NSSize fitting = self.window.contentView.fittingSize;
+    fitting.width = MAX(fitting.width, 420);
+    fitting.height = MAX(fitting.height, 300);
+    [self.window setContentSize:fitting];
+}
+
+- (NSView *)cardWithTitle:(NSString *)title content:(NSView *)content {
+    NSStackView *stack = [[NSStackView alloc] init];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 6;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+
+    if (title.length > 0) {
+        [stack addArrangedSubview:[self makeSectionLabel:title]];
+    }
+
+    NSBox *box = [[NSBox alloc] init];
+    box.boxType = NSBoxCustom;
+    box.borderWidth = 0;
+    box.cornerRadius = 10;
+    box.fillColor = [NSColor controlBackgroundColor];
+    box.titlePosition = NSNoTitle;
+    box.translatesAutoresizingMaskIntoConstraints = NO;
+    box.contentViewMargins = NSMakeSize(14, 12);
+    [box.contentView addSubview:content];
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+        [content.topAnchor constraintEqualToAnchor:box.contentView.topAnchor],
+        [content.leadingAnchor constraintEqualToAnchor:box.contentView.leadingAnchor],
+        [content.trailingAnchor constraintEqualToAnchor:box.contentView.trailingAnchor],
+        [content.bottomAnchor constraintEqualToAnchor:box.contentView.bottomAnchor],
+    ]];
+
+    [stack addArrangedSubview:box];
+    [box.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+    return stack;
 }
 
 - (NSTextField *)makeSectionLabel:(NSString *)title {
     NSTextField *label = [NSTextField labelWithString:title];
-    label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    label.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
     label.textColor = [NSColor secondaryLabelColor];
     label.alignment = NSTextAlignmentNatural;
-    [label setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
     return label;
 }
 
@@ -220,18 +247,18 @@ int onDevicesChanged(AudioObjectID inObjectID,
 
     self.driverStatusImage = [[NSImageView alloc] initWithFrame:NSZeroRect];
     self.driverStatusImage.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.driverStatusImage.widthAnchor constraintEqualToConstant:18].active = YES;
-    [self.driverStatusImage.heightAnchor constraintEqualToConstant:18].active = YES;
+    [self.driverStatusImage.widthAnchor constraintEqualToConstant:16].active = YES;
+    [self.driverStatusImage.heightAnchor constraintEqualToConstant:16].active = YES;
 
     self.driverStatusLabel = [NSTextField labelWithString:@"正在检查驱动…"];
     self.driverStatusLabel.font = [NSFont systemFontOfSize:13];
 
     NSView *spacer = [[NSView alloc] init];
-    spacer.translatesAutoresizingMaskIntoConstraints = NO;
     [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    self.driverActionButton = [NSButton buttonWithTitle:@"安装驱动" target:self action:@selector(driverActionClicked:)];
-    self.driverActionButton.bezelStyle = NSBezelStyleRounded;
+    self.driverActionButton = [NSButton buttonWithTitle:@"安装" target:self action:@selector(driverActionClicked:)];
+    self.driverActionButton.bezelStyle = NSBezelStyleFlexiblePush;
+    self.driverActionButton.controlSize = NSControlSizeSmall;
 
     [row addArrangedSubview:self.driverStatusImage];
     [row addArrangedSubview:self.driverStatusLabel];
@@ -240,35 +267,47 @@ int onDevicesChanged(AudioObjectID inObjectID,
     return row;
 }
 
-- (NSView *)makeSoundSettingsLink {
-    NSButton *button = [NSButton buttonWithTitle:@"打开系统声音设置…" target:self action:@selector(openSoundSettings:)];
-    button.bezelStyle = NSBezelStyleInline;
-    button.font = [NSFont systemFontOfSize:11];
-    return button;
+- (NSView *)formRowWithTitle:(NSString *)title field:(NSView *)field {
+    NSTextField *label = [NSTextField labelWithString:title];
+    label.alignment = NSTextAlignmentRight;
+    label.font = [NSFont systemFontOfSize:13];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    [label.widthAnchor constraintEqualToConstant:36].active = YES;
+    [label setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+
+    NSStackView *row = [NSStackView stackViewWithViews:@[ label, field ]];
+    row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    row.alignment = NSLayoutAttributeCenterY;
+    row.spacing = 10;
+    [field setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [field setContentCompressionResistancePriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return row;
 }
 
 - (NSView *)makeOutputForm {
-    NSGridView *grid = [NSGridView gridViewWithNumberOfColumns:2 rows:0];
-    grid.rowSpacing = 10;
-    grid.columnSpacing = 12;
-    grid.translatesAutoresizingMaskIntoConstraints = NO;
-
-    NSTextField *nameLabel = [NSTextField labelWithString:@"名称"];
-    nameLabel.alignment = NSTextAlignmentRight;
-    self.deviceNameTextField = [[NSTextField alloc] initWithFrame:NSZeroRect];
-    self.deviceNameTextField.target = self;
-    self.deviceNameTextField.action = @selector(deviceNameEntered:);
-    [self.deviceNameTextField.widthAnchor constraintGreaterThanOrEqualToConstant:280].active = YES;
-
-    NSTextField *targetLabel = [NSTextField labelWithString:@"电视"];
-    targetLabel.alignment = NSTextAlignmentRight;
     self.outputDevicePopUp = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     self.outputDevicePopUp.target = self;
     self.outputDevicePopUp.action = @selector(outputDeviceSelected:);
     self.outputDevicePopUp.autoenablesItems = NO;
 
-    NSTextField *bufferLabel = [NSTextField labelWithString:@"缓冲"];
-    bufferLabel.alignment = NSTextAlignmentRight;
+    NSButton *soundButton = [NSButton buttonWithTitle:@"系统声音设置" target:self action:@selector(openSoundSettings:)];
+    soundButton.bezelStyle = NSBezelStyleFlexiblePush;
+    soundButton.controlSize = NSControlSizeSmall;
+
+    NSStackView *stack = [[NSStackView alloc] init];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 8;
+    [stack addArrangedSubview:[self formRowWithTitle:@"电视" field:self.outputDevicePopUp]];
+    [stack addArrangedSubview:soundButton];
+    return stack;
+}
+
+- (NSView *)makeAdvancedForm {
+    self.deviceNameTextField = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    self.deviceNameTextField.target = self;
+    self.deviceNameTextField.action = @selector(deviceNameEntered:);
+
     self.bufferSizePopUp = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     self.bufferSizePopUp.target = self;
     self.bufferSizePopUp.action = @selector(outputDeviceBufferFrameSizeSelected:);
@@ -277,31 +316,49 @@ int onDevicesChanged(AudioObjectID inObjectID,
     }
     [self.bufferSizePopUp selectItemWithTitle:@"512"];
 
-    [grid addRowWithViews:@[ nameLabel, self.deviceNameTextField ]];
-    [grid addRowWithViews:@[ targetLabel, self.outputDevicePopUp ]];
-    [grid addRowWithViews:@[ bufferLabel, self.bufferSizePopUp ]];
-    [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
-    [grid columnAtIndex:1].xPlacement = NSGridCellPlacementFill;
-    return grid;
+    NSStackView *stack = [[NSStackView alloc] init];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 8;
+    [stack addArrangedSubview:[self formRowWithTitle:@"名称" field:self.deviceNameTextField]];
+    [stack addArrangedSubview:[self formRowWithTitle:@"缓冲" field:self.bufferSizePopUp]];
+    return stack;
+}
+
+- (NSView *)makeAdvancedToggle {
+    advancedToggle = [NSButton buttonWithTitle:@"高级" target:self action:@selector(toggleAdvanced:)];
+    advancedToggle.bezelStyle = NSBezelStyleFlexiblePush;
+    advancedToggle.controlSize = NSControlSizeSmall;
+    return advancedToggle;
+}
+
+- (void)toggleAdvanced:(id)sender {
+#pragma unused(sender)
+    advancedContainer.hidden = !advancedContainer.hidden;
+    advancedToggle.title = advancedContainer.hidden ? @"高级" : @"隐藏高级";
+    [self sizeWindowToFit];
 }
 
 - (NSView *)makeActiveConditionGroup {
     NSStackView *stack = [[NSStackView alloc] init];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
-    stack.spacing = 8;
+    stack.spacing = 4;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
 
-    self.proxiedDeviceIsActiveRadioButton = [self radio:@"有声音在播放时" action:@selector(proxiedDeviceIsActiveConditionSelected:)];
+    self.proxiedDeviceIsActiveRadioButton = [self radio:@"仅播放时" action:@selector(proxiedDeviceIsActiveConditionSelected:)];
     self.userIsActiveRadioButton = [self radio:@"使用电脑时" action:@selector(userIsActiveConditionSelected:)];
-    self.alwaysRadioButton = [self radio:@"始终（会阻止睡眠）" action:@selector(alwaysConditionSelected:)];
+    self.alwaysRadioButton = [self radio:@"始终" action:@selector(alwaysConditionSelected:)];
 
-    [stack addArrangedSubview:[self radioBlock:self.proxiedDeviceIsActiveRadioButton
-                                       caption:@"最省电，但声音刚响起时可能被切掉一小截"]];
-    [stack addArrangedSubview:[self radioBlock:self.userIsActiveRadioButton
-                                       caption:@"正在用电脑时保持输出，闲置后停止，不挡住睡眠"]];
-    [stack addArrangedSubview:[self radioBlock:self.alwaysRadioButton
-                                       caption:@"声音最稳，但电脑可能无法休眠"]];
+    activityCaptionLabel = [NSTextField wrappingLabelWithString:@""];
+    activityCaptionLabel.font = [NSFont systemFontOfSize:11];
+    activityCaptionLabel.textColor = [NSColor secondaryLabelColor];
+    activityCaptionLabel.preferredMaxLayoutWidth = 340;
+
+    [stack addArrangedSubview:self.proxiedDeviceIsActiveRadioButton];
+    [stack addArrangedSubview:self.userIsActiveRadioButton];
+    [stack addArrangedSubview:self.alwaysRadioButton];
+    [stack addArrangedSubview:activityCaptionLabel];
     return stack;
 }
 
@@ -313,22 +370,6 @@ int onDevicesChanged(AudioObjectID inObjectID,
     button.action = action;
     button.font = [NSFont systemFontOfSize:13];
     return button;
-}
-
-- (NSView *)radioBlock:(NSButton *)button caption:(NSString *)caption {
-    NSStackView *block = [[NSStackView alloc] init];
-    block.orientation = NSUserInterfaceLayoutOrientationVertical;
-    block.alignment = NSLayoutAttributeLeading;
-    block.spacing = 2;
-    NSTextField *hint = [NSTextField wrappingLabelWithString:caption];
-    hint.font = [NSFont systemFontOfSize:11];
-    hint.textColor = [NSColor secondaryLabelColor];
-    hint.preferredMaxLayoutWidth = 360;
-    [hint setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
-                                    forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [block addArrangedSubview:button];
-    [block addArrangedSubview:hint];
-    return block;
 }
 
 - (void)setSettingsEnabled:(BOOL)enabled {
@@ -348,19 +389,19 @@ int onDevicesChanged(AudioObjectID inObjectID,
     NSString *symbol = @"xmark.circle.fill";
     NSColor *tint = [NSColor systemRedColor];
     NSString *status = @"未安装驱动";
-    NSString *action = @"安装驱动";
+    NSString *action = @"安装";
     BOOL actionEnabled = YES;
 
     if (loaded) {
         symbol = @"checkmark.circle.fill";
         tint = [NSColor systemGreenColor];
         status = @"驱动已就绪";
-        action = @"卸载驱动";
+        action = @"卸载";
     } else if (installed) {
         symbol = @"exclamationmark.circle.fill";
         tint = [NSColor systemOrangeColor];
         status = @"驱动已安装，正在加载…";
-        action = @"卸载驱动";
+        action = @"卸载";
     }
 
     if (@available(macOS 11.0, *)) {
@@ -385,6 +426,17 @@ int onDevicesChanged(AudioObjectID inObjectID,
         condition == ProxyAudioDevice::ActiveCondition::userActive ? NSControlStateValueOn : NSControlStateValueOff;
     self.alwaysRadioButton.state =
         condition == ProxyAudioDevice::ActiveCondition::always ? NSControlStateValueOn : NSControlStateValueOff;
+    [self updateActivityCaption];
+}
+
+- (void)updateActivityCaption {
+    NSString *caption = @"使用电脑时保持输出，闲置后停止，不阻止睡眠。";
+    if (self.proxiedDeviceIsActiveRadioButton.state == NSControlStateValueOn) {
+        caption = @"最省电，声音刚响起时可能被切掉一小截。";
+    } else if (self.alwaysRadioButton.state == NSControlStateValueOn) {
+        caption = @"声音最稳，但可能会阻止电脑休眠。";
+    }
+    activityCaptionLabel.stringValue = caption;
 }
 
 #pragma mark - Driver install / uninstall
@@ -675,6 +727,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.alwaysRadioButton.state = NSControlStateValueOff;
     self.userIsActiveRadioButton.state = NSControlStateValueOff;
     [self setCurrentOutputDeviceActiveCondition:ProxyAudioDevice::ActiveCondition::proxiedDeviceActive];
+    [self updateActivityCaption];
 }
 
 - (IBAction)userIsActiveConditionSelected:(id)sender {
@@ -682,6 +735,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.alwaysRadioButton.state = NSControlStateValueOff;
     self.proxiedDeviceIsActiveRadioButton.state = NSControlStateValueOff;
     [self setCurrentOutputDeviceActiveCondition:ProxyAudioDevice::ActiveCondition::userActive];
+    [self updateActivityCaption];
 }
 
 - (IBAction)alwaysConditionSelected:(id)sender {
@@ -689,6 +743,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.proxiedDeviceIsActiveRadioButton.state = NSControlStateValueOff;
     self.userIsActiveRadioButton.state = NSControlStateValueOff;
     [self setCurrentOutputDeviceActiveCondition:ProxyAudioDevice::ActiveCondition::always];
+    [self updateActivityCaption];
 }
 
 @end
