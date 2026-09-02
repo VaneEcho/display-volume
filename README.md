@@ -1,72 +1,55 @@
-## Proxy Audio Driver
+# Proxy Audio
 
-A HAL virtual audio driver for macOS that sends all output to another audio device. Its main purpose is to make it possible to use macOS's system volume controls, such as the volume menu bar icon or volume keyboard keys, to change the volume of external audio interfaces that don't allow it. It might be useful for something else, too.
+macOS 虚拟声卡。让 HDMI 电视 / 显示器也能用系统音量键。
 
-### Installation
+基于 [briankendall/proxy-audio-device](https://github.com/briankendall/proxy-audio-device)（Unlicense）。这是独立仓库，不是官方 Fork。
 
-#### Install with a package manager
+## 解决什么问题
 
-[![Packaging status on repology](https://repology.org/badge/vertical-allrepos/proxy-audio-device.svg)](https://repology.org/project/proxy-audio-device/versions)
+不少 Mac（尤其是 Mac mini）用 HDMI 接电视或显示器时，系统声音里那台设备是亮的，**音量却是灰的**，菜单栏和键盘音量键都调不了。
 
-Install [proxy-audio-device with Homebrew with `brew`](https://formulae.brew.sh/cask/proxy-audio-device):
+Proxy Audio 在系统里加一块虚拟输出。你把系统默认输出设成它，音量键调的是这块虚拟声卡；驱动再把声音转到真正的 HDMI 设备上。
 
-    brew install --cask proxy-audio-device
+这是原项目就有的做法。本仓库多做的是：**电视关掉、电脑休眠再醒来之后，驱动自己把 HDMI 设备找回来**，不用再打开设置重选。
 
-_or_ [proxy-audio-device on macports with `port`](https://ports.macports.org/port/proxy-audio-device/):
+HDMI 断电后设备 UID 有时会变，睡眠唤醒时系统通知也不总是到。所以这里会记住设备名 / 厂商 / 传输类型，并定期复查。在 LG OLED（系统里常叫 **LG TV SSCR2**，C2 / C3 / C4 都一样）上是这么用的；同一类 HDMI 音量灰色、休眠后丢设备的情况，也可能适用。
 
-    sudo port install proxy-audio-device
+## 和上游的区别
 
-Run the _Proxy Audio Device Settings_ app to configure your new audio device.
+- 目标设备离线后再出现时自动重新绑定
+- 监听设备列表和 `DeviceIsAlive`，通知丢了大约每 5 秒再查
+- 设置 App 可安装 / 卸载驱动，不需要自己拷 HAL 插件
+- 未合入上游里改实时音频时钟的 PR
 
-#### Manual installation
+无官方签名和公证，只适合本机使用。修改过的驱动不能和官方安装包混装。
 
-1. Download the latest release from this GitHub repository
+## 使用
 
-2. Create the directory `HAL` if it does not exist. Open a terminal window, execute the following command and enter your administrator password when prompted:
+1. 用 Xcode 构建 **Proxy Audio Device Settings** scheme（Release），得到 `Proxy Audio.app`（驱动打在 App 里）
+2. 拖到「应用程序」后打开
+3. 未装驱动时点「安装」，输入密码
+4. 「电视」选你的 HDMI 输出（例如 LG TV SSCR2）
+5. 系统设置 → 声音，默认输出选 **Proxy Audio Device**
+6. 「保持工作」用「使用电脑时」，这样不会挡住睡眠
 
-        sudo mkdir /Library/Audio/Plug-Ins/HAL
+缓冲大小放在「高级」里。太小会爆音或失真，一般保持 512。
 
-3. Move the directory `ProxyAudioDriver.driver` to `/Library/Audio/Plug-Ins/HAL` and assign it the correct owner. Execute in the root directory of the unzipped file:
+卸载：在 App 里点「卸载」。
 
-        sudo mv ./ProxyAudioDevice.driver /Library/Audio/Plug-Ins/HAL/
-        sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
+## 构建
 
-4. Either reboot your system or reboot Core Audio by executing the following command:
+需要完整 Xcode。
 
-        # macOS <= 13
-        sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
-   
-        # macOS >= 14.4
-        sudo killall coreaudiod
+```
+xcodebuild -project proxyAudioDevice.xcodeproj \
+  -scheme "Proxy Audio Device Settings" \
+  -configuration Release \
+  CODE_SIGNING_ALLOWED=NO \
+  build
+```
 
-6. Run Proxy Audio Device Settings to configure the proxy output device's name, which output device the driver will proxy to, and how large you want its audio buffer to be.
+产物在 DerivedData 的 `Release/Proxy Audio.app`。
 
-### Uninstallation
+## License
 
-1. Open a terminal window and execute the following command:
-
-        sudo rm -rf /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
-
-2. Either reboot your system or reboot Core Audio by executing the following command:
-
-        # macOS <= 13
-        sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
-   
-        # macOS >= 14.4
-        sudo killall coreaudiod
-
-### Building
-
-Clone the repo, open the Xcode project and build the driver and the settings application. Then follow the above installation instructions to install it.
-
-
-### Issues
-
-If you make the audio buffer too small then the driver will introduce pops, crackles, or distortion. If you notice that then try increasing the buffer size.
-
-
-### Possible Future Work
-
-- Indicator in the settings app for when the proxy audio device overruns its buffer and causes audio artifacts
-- Proxying more than two channels of audio
-- Ability to increase the number of proxy devices
+[Unlicense](LICENSE)。原作者 Brian Kendall。
