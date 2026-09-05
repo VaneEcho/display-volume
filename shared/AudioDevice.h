@@ -34,7 +34,7 @@ class AudioDevice {
     static AudioObjectID defaultOutputDevice();
     static CFStringRef copyDeviceUID(AudioObjectID device);
     static CFStringRef copyObjectName(AudioObjectID device);
-    static void setObjectName(AudioObjectID device, CFStringRef newName);
+    static OSStatus setObjectName(AudioObjectID device, CFStringRef newName);
     static AudioDeviceID audioDeviceIDForUID(CFStringRef uid, AudioObjectPropertySelector selector);
     static AudioDeviceID audioDeviceIDForDeviceUID(CFStringRef uid);
     static AudioDeviceID audioDeviceIDForBoxUID(CFStringRef uid);
@@ -47,6 +47,7 @@ class AudioDevice {
     Float64 sampleRate;
     AudioDeviceIOProcID procId;
     bool isStarted;
+    UInt32 stereoChannels[2] = {0, 1};
 
   protected:
     void initialize();

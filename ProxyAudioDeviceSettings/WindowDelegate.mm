@@ -4,46 +4,37 @@
 #include "AudioDevice.h"
 #include "ProxyAudioDevice.h"
 
-int onDevicesChanged(AudioObjectID inObjectID,
-                     UInt32 inNumberAddresses,
-                     const AudioObjectPropertyAddress *inAddresses,
-                     void *inClientData);
-
 static NSString *const kDeviceNameCacheKey = @"deviceNameCacheByUID";
 static NSString *const kHALDriverPath = @"/Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver";
 
 @implementation WindowDelegate {
     std::vector<AudioDeviceID> currentDeviceList;
-    int initializationAttemptInterval;
     NSTimer *refreshTimer;
     NSString *lastDeviceListSignature;
     bool nativeUIBuilt;
-    bool audioListenerInstalled;
     NSView *advancedContainer;
     NSTextField *activityCaptionLabel;
     NSButton *advancedToggle;
+    NSButton *enableOutputButton;
+    NSButton *installButton;
+    AudioDeviceID configuredBox;
+    NSStackView *rootStack;
+    NSTextField *bufferHint;
+
 }
 
 - (void)awakeFromNib {
-    initializationAttemptInterval = 3;
     nativeUIBuilt = false;
-    audioListenerInstalled = false;
     [self buildNativeUI];
+    for (NSMenuItem *item in [NSApp.mainMenu.itemArray copy]) {
+        if ([item.title isEqualToString:@"File"] || [item.title isEqualToString:@"Help"]) {
+            [NSApp.mainMenu removeItem:item];
+        }
+    }
     [self updateDriverStatus];
     [self setSettingsEnabled:NO];
-    [self keepTryingToInitializeUntilSuccess];
-}
-
-- (void)keepTryingToInitializeUntilSuccess {
-    bool success = [self initialize];
-    if (!success) {
-        [NSTimer scheduledTimerWithTimeInterval:initializationAttemptInterval
-                                         target:self
-                                       selector:@selector(keepTryingToInitializeUntilSuccess)
-                                       userInfo:nil
-                                        repeats:NO];
-        initializationAttemptInterval += 2;
-    }
+    [self startRefreshTimer];
+    [self initialize];
 }
 
 - (bool)initialize {
@@ -51,23 +42,22 @@ static NSString *const kHALDriverPath = @"/Library/Audio/Plug-Ins/HAL/ProxyAudio
 
     if (![self proxyAudioDeviceAvailable]) {
         [self setSettingsEnabled:NO];
-        return true;
+        configuredBox = kAudioObjectUnknown;
+        return false;
     }
 
     if (![self setCurrentProcessAsConfigurator]) {
         return false;
     }
 
+    lastDeviceListSignature = nil;
     self.deviceNameTextField.stringValue = [self currentDeviceName];
 
     if (![self refreshOutputDevices]) {
         return false;
     }
 
-    if (!audioListenerInstalled && ![self setupListenerForCurrentAudioDevices]) {
-        return false;
-    }
-    audioListenerInstalled = true;
+
     [self startRefreshTimer];
 
     NSString *bufferSize = [self currentOutputDeviceBufferFrameSize];
@@ -75,6 +65,7 @@ static NSString *const kHALDriverPath = @"/Library/Audio/Plug-Ins/HAL/ProxyAudio
         [self.bufferSizePopUp selectItemWithTitle:bufferSize];
     }
 
+    configuredBox = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
     [self setSettingsEnabled:YES];
     [self updateActiveConditionControls];
     [self updateDriverStatus];
@@ -90,27 +81,6 @@ static NSString *const kHALDriverPath = @"/Library/Audio/Plug-Ins/HAL/ProxyAudio
         return false;
     }
     return true;
-}
-
-int onDevicesChanged(AudioObjectID inObjectID,
-                     UInt32 inNumberAddresses,
-                     const AudioObjectPropertyAddress *inAddresses,
-                     void *inClientData) {
-#pragma unused(inObjectID, inNumberAddresses, inAddresses)
-    dispatch_async(dispatch_get_main_queue(), ^{
-        WindowDelegate *delegate = (__bridge WindowDelegate *)inClientData;
-        [delegate refreshOutputDevices];
-        [delegate updateDriverStatus];
-    });
-    return noErr;
-}
-
-- (bool)setupListenerForCurrentAudioDevices {
-    AudioObjectPropertyAddress listenerPropertyAddress = {
-        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
-    OSStatus err = AudioObjectAddPropertyListener(
-        kAudioObjectSystemObject, &listenerPropertyAddress, &onDevicesChanged, (__bridge_retained void *)self);
-    return err == noErr;
 }
 
 - (bool)proxyAudioDeviceAvailable {
@@ -133,15 +103,20 @@ int onDevicesChanged(AudioObjectID inObjectID,
     }
 
     NSWindow *window = self.window;
-    window.title = @"Proxy Audio";
+    window.title = @"Display Volume";
     window.styleMask |= NSWindowStyleMaskResizable;
-    window.contentMinSize = NSMakeSize(380, 320);
-    window.contentMaxSize = NSMakeSize(720, 900);
+    window.contentMinSize = NSMakeSize(420, 200);
+    window.contentMaxSize = NSMakeSize(560, 780);
+    window.titlebarAppearsTransparent = YES;
+    window.autorecalculatesKeyViewLoop = YES;
+    [window setFrameAutosaveName:@"ProxyAudioSettings"];
+    window.backgroundColor = [NSColor windowBackgroundColor];
 
     NSView *content = [[NSView alloc] initWithFrame:NSZeroRect];
     window.contentView = content;
 
     NSStackView *root = [[NSStackView alloc] init];
+    rootStack = root;
     root.orientation = NSUserInterfaceLayoutOrientationVertical;
     root.alignment = NSLayoutAttributeLeading;
     root.spacing = 14;
@@ -152,12 +127,11 @@ int onDevicesChanged(AudioObjectID inObjectID,
         [root.topAnchor constraintEqualToAnchor:content.topAnchor constant:18],
         [root.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:18],
         [root.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-18],
-        [root.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-18],
+        [root.bottomAnchor constraintLessThanOrEqualToAnchor:content.bottomAnchor constant:-18],
     ]];
 
     NSView *statusCard = [self cardWithTitle:nil content:[self makeDriverStatusRow]];
     NSView *outputCard = [self cardWithTitle:@"输出" content:[self makeOutputForm]];
-    NSView *activeCard = [self cardWithTitle:@"保持工作" content:[self makeActiveConditionGroup]];
     NSView *advancedCard = [self cardWithTitle:nil content:[self makeAdvancedForm]];
     advancedContainer = advancedCard;
     advancedContainer.hidden = YES;
@@ -173,15 +147,15 @@ int onDevicesChanged(AudioObjectID inObjectID,
     [root addArrangedSubview:settings];
 
     [settings addArrangedSubview:outputCard];
-    [settings addArrangedSubview:activeCard];
-    [settings addArrangedSubview:[self makeAdvancedToggle]];
+    NSView *footer = [self makeAdvancedToggle];
+    [settings addArrangedSubview:footer];
+    [footer.widthAnchor constraintEqualToAnchor:settings.widthAnchor].active = YES;
     [settings addArrangedSubview:advancedCard];
 
     [NSLayoutConstraint activateConstraints:@[
         [statusCard.widthAnchor constraintEqualToAnchor:root.widthAnchor],
         [settings.widthAnchor constraintEqualToAnchor:root.widthAnchor],
         [outputCard.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
-        [activeCard.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
         [advancedCard.widthAnchor constraintEqualToAnchor:settings.widthAnchor],
     ]];
 
@@ -191,9 +165,10 @@ int onDevicesChanged(AudioObjectID inObjectID,
 
 - (void)sizeWindowToFit {
     [self.window.contentView layoutSubtreeIfNeeded];
-    NSSize fitting = self.window.contentView.fittingSize;
-    fitting.width = MAX(fitting.width, 420);
-    fitting.height = MAX(fitting.height, 300);
+    NSSize fitting = rootStack.fittingSize;
+    fitting.width = MAX(self.window.contentView.frame.size.width, 420);
+    fitting.height = MAX(fitting.height + 36, 200);
+    self.window.contentMinSize = NSMakeSize(420, fitting.height);
     [self.window setContentSize:fitting];
 }
 
@@ -211,7 +186,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
     NSBox *box = [[NSBox alloc] init];
     box.boxType = NSBoxCustom;
     box.borderWidth = 0;
-    box.cornerRadius = 10;
+    box.cornerRadius = 14;
     box.fillColor = [NSColor controlBackgroundColor];
     box.titlePosition = NSNoTitle;
     box.translatesAutoresizingMaskIntoConstraints = NO;
@@ -251,19 +226,21 @@ int onDevicesChanged(AudioObjectID inObjectID,
     [self.driverStatusImage.heightAnchor constraintEqualToConstant:16].active = YES;
 
     self.driverStatusLabel = [NSTextField labelWithString:@"正在检查驱动…"];
-    self.driverStatusLabel.font = [NSFont systemFontOfSize:13];
+    self.driverStatusLabel.font = [NSFont systemFontOfSize:14 weight:NSFontWeightSemibold];
 
     NSView *spacer = [[NSView alloc] init];
     [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     self.driverActionButton = [NSButton buttonWithTitle:@"安装" target:self action:@selector(driverActionClicked:)];
     self.driverActionButton.bezelStyle = NSBezelStyleFlexiblePush;
-    self.driverActionButton.controlSize = NSControlSizeSmall;
+    self.driverActionButton.controlSize = NSControlSizeRegular;
 
     [row addArrangedSubview:self.driverStatusImage];
     [row addArrangedSubview:self.driverStatusLabel];
     [row addArrangedSubview:spacer];
-    [row addArrangedSubview:self.driverActionButton];
+    installButton = [NSButton buttonWithTitle:@"安装驱动" target:self action:@selector(driverActionClicked:)];
+    installButton.bezelStyle = NSBezelStyleFlexiblePush;
+    [row addArrangedSubview:installButton];
     return row;
 }
 
@@ -272,7 +249,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
     label.alignment = NSTextAlignmentRight;
     label.font = [NSFont systemFontOfSize:13];
     label.translatesAutoresizingMaskIntoConstraints = NO;
-    [label.widthAnchor constraintEqualToConstant:36].active = YES;
+    [label.widthAnchor constraintEqualToConstant:44].active = YES;
     [label setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     NSStackView *row = [NSStackView stackViewWithViews:@[ label, field ]];
@@ -290,16 +267,17 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.outputDevicePopUp.action = @selector(outputDeviceSelected:);
     self.outputDevicePopUp.autoenablesItems = NO;
 
-    NSButton *soundButton = [NSButton buttonWithTitle:@"系统声音设置" target:self action:@selector(openSoundSettings:)];
-    soundButton.bezelStyle = NSBezelStyleFlexiblePush;
-    soundButton.controlSize = NSControlSizeSmall;
+    enableOutputButton = [NSButton buttonWithTitle:@"设为系统输出" target:self action:@selector(enableSystemOutput:)];
+    enableOutputButton.bezelStyle = NSBezelStyleFlexiblePush;
 
     NSStackView *stack = [[NSStackView alloc] init];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
     stack.spacing = 8;
-    [stack addArrangedSubview:[self formRowWithTitle:@"电视" field:self.outputDevicePopUp]];
-    [stack addArrangedSubview:soundButton];
+    NSView *deviceRow = [self formRowWithTitle:@"设备" field:self.outputDevicePopUp];
+    [stack addArrangedSubview:deviceRow];
+    [deviceRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+    [stack addArrangedSubview:enableOutputButton];
     return stack;
 }
 
@@ -311,7 +289,8 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.bufferSizePopUp = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     self.bufferSizePopUp.target = self;
     self.bufferSizePopUp.action = @selector(outputDeviceBufferFrameSizeSelected:);
-    for (NSString *size in @[ @"8", @"16", @"32", @"64", @"128", @"256", @"512", @"1024", @"2048" ]) {
+    self.bufferSizePopUp.autoenablesItems = NO;
+    for (NSString *size in @[ @"128", @"256", @"512", @"1024", @"2048" ]) {
         [self.bufferSizePopUp addItemWithTitle:size];
     }
     [self.bufferSizePopUp selectItemWithTitle:@"512"];
@@ -320,22 +299,46 @@ int onDevicesChanged(AudioObjectID inObjectID,
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
     stack.spacing = 8;
-    [stack addArrangedSubview:[self formRowWithTitle:@"名称" field:self.deviceNameTextField]];
-    [stack addArrangedSubview:[self formRowWithTitle:@"缓冲" field:self.bufferSizePopUp]];
+    [stack addArrangedSubview:[self makeSectionLabel:@"运行方式"]];
+    [stack addArrangedSubview:[self makeActiveConditionGroup]];
+    for (NSView *row in @[[self formRowWithTitle:@"名称" field:self.deviceNameTextField],
+                          [self formRowWithTitle:@"缓冲" field:self.bufferSizePopUp]]) {
+        [stack addArrangedSubview:row];
+        [row.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+    }
+    NSTextField *hint = [NSTextField wrappingLabelWithString:@"缓冲越大，播放越稳。默认 512。"];
+    bufferHint = hint;
+    hint.font = [NSFont systemFontOfSize:12];
+    hint.textColor = [NSColor secondaryLabelColor];
+    [stack addArrangedSubview:hint];
+    NSButton *update = [NSButton buttonWithTitle:@"更新驱动…" target:self action:@selector(updateDriver:)];
+    update.bezelStyle = NSBezelStyleFlexiblePush;
+    NSStackView *driverActions = [NSStackView stackViewWithViews:@[update, self.driverActionButton]];
+    driverActions.spacing = 10;
+    [stack addArrangedSubview:driverActions];
     return stack;
 }
 
 - (NSView *)makeAdvancedToggle {
     advancedToggle = [NSButton buttonWithTitle:@"高级" target:self action:@selector(toggleAdvanced:)];
     advancedToggle.bezelStyle = NSBezelStyleFlexiblePush;
-    advancedToggle.controlSize = NSControlSizeSmall;
-    return advancedToggle;
+    advancedToggle.controlSize = NSControlSizeRegular;
+    NSButton *soundButton = [NSButton buttonWithTitle:@"声音设置…" target:self action:@selector(openSoundSettings:)];
+    soundButton.bordered = NO;
+    soundButton.font = [NSFont systemFontOfSize:12];
+    soundButton.contentTintColor = [NSColor secondaryLabelColor];
+    NSView *spacer = [[NSView alloc] init];
+    [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    NSStackView *footer = [NSStackView stackViewWithViews:@[advancedToggle, spacer, soundButton]];
+    footer.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    footer.alignment = NSLayoutAttributeCenterY;
+    return footer;
 }
 
 - (void)toggleAdvanced:(id)sender {
 #pragma unused(sender)
     advancedContainer.hidden = !advancedContainer.hidden;
-    advancedToggle.title = advancedContainer.hidden ? @"高级" : @"隐藏高级";
+    advancedToggle.title = advancedContainer.hidden ? @"高级" : @"收起高级";
     [self sizeWindowToFit];
 }
 
@@ -346,9 +349,9 @@ int onDevicesChanged(AudioObjectID inObjectID,
     stack.spacing = 4;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
 
-    self.proxiedDeviceIsActiveRadioButton = [self radio:@"仅播放时" action:@selector(proxiedDeviceIsActiveConditionSelected:)];
-    self.userIsActiveRadioButton = [self radio:@"使用电脑时" action:@selector(userIsActiveConditionSelected:)];
-    self.alwaysRadioButton = [self radio:@"始终" action:@selector(alwaysConditionSelected:)];
+    self.proxiedDeviceIsActiveRadioButton = [self radio:@"播放时" action:@selector(proxiedDeviceIsActiveConditionSelected:)];
+    self.userIsActiveRadioButton = [self radio:@"自动（推荐）" action:@selector(userIsActiveConditionSelected:)];
+    self.alwaysRadioButton = [self radio:@"持续运行" action:@selector(alwaysConditionSelected:)];
 
     activityCaptionLabel = [NSTextField wrappingLabelWithString:@""];
     activityCaptionLabel.font = [NSFont systemFontOfSize:11];
@@ -373,6 +376,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
 }
 
 - (void)setSettingsEnabled:(BOOL)enabled {
+    BOOL changed = self.settingsContainer.hidden == enabled;
     self.settingsContainer.hidden = !enabled;
     self.deviceNameTextField.enabled = enabled;
     self.outputDevicePopUp.enabled = enabled;
@@ -380,6 +384,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.proxiedDeviceIsActiveRadioButton.enabled = enabled;
     self.userIsActiveRadioButton.enabled = enabled;
     self.alwaysRadioButton.enabled = enabled;
+    if (changed) [self sizeWindowToFit];
 }
 
 - (void)updateDriverStatus {
@@ -388,19 +393,38 @@ int onDevicesChanged(AudioObjectID inObjectID,
 
     NSString *symbol = @"xmark.circle.fill";
     NSColor *tint = [NSColor systemRedColor];
-    NSString *status = @"未安装驱动";
+    NSString *status = @"安装后即可用音量键调节";
     NSString *action = @"安装";
     BOOL actionEnabled = YES;
 
     if (loaded) {
         symbol = @"checkmark.circle.fill";
         tint = [NSColor systemGreenColor];
-        status = @"驱动已就绪";
+        NSString *targetUID = [self currentOutputDeviceUID];
+        AudioDeviceID target = targetUID.length ? AudioDevice::audioDeviceIDForDeviceUID((__bridge CFStringRef)targetUID) : kAudioObjectUnknown;
+        AudioDeviceID proxy = AudioDevice::audioDeviceIDForDeviceUID(CFSTR(kDevice_UID));
+        BOOL enabled = proxy != kAudioObjectUnknown && AudioDevice::defaultOutputDevice() == proxy;
+        if (target == kAudioObjectUnknown) {
+            status = @"等待设备连接";
+            symbol = @"clock.fill";
+            tint = [NSColor secondaryLabelColor];
+        } else if (!enabled) {
+            status = @"尚未启用";
+            symbol = @"speaker.wave.2";
+            tint = [NSColor secondaryLabelColor];
+        } else if ([[self readConfigValueForType:ProxyAudioDevice::ConfigType::outputRuntimeState] isEqualToString:@"0"]) {
+            status = @"正在连接输出…";
+            symbol = @"clock.fill";
+            tint = [NSColor secondaryLabelColor];
+        } else {
+            status = @"已启用 · 音量键可用";
+        }
+        enableOutputButton.hidden = enabled;
         action = @"卸载";
     } else if (installed) {
         symbol = @"exclamationmark.circle.fill";
         tint = [NSColor systemOrangeColor];
-        status = @"驱动已安装，正在加载…";
+        status = @"正在连接驱动…";
         action = @"卸载";
     }
 
@@ -410,7 +434,10 @@ int onDevicesChanged(AudioObjectID inObjectID,
         self.driverStatusImage.contentTintColor = tint;
     }
     self.driverStatusLabel.stringValue = status;
-    self.driverActionButton.title = action;
+    self.driverActionButton.title = [action isEqualToString:@"卸载"] ? @"卸载驱动…" : @"安装驱动";
+    installButton.hidden = loaded;
+    installButton.title = installed ? @"移除驱动…" : @"安装驱动";
+    installButton.enabled = installed || [self bundledDriverPath] != nil;
     self.driverActionButton.enabled = actionEnabled;
     if (![self bundledDriverPath] && !loaded && !installed) {
         self.driverActionButton.enabled = NO;
@@ -430,11 +457,11 @@ int onDevicesChanged(AudioObjectID inObjectID,
 }
 
 - (void)updateActivityCaption {
-    NSString *caption = @"使用电脑时保持输出，闲置后停止，不阻止睡眠。";
+    NSString *caption = @"使用或播放时运行，空闲时暂停。";
     if (self.proxiedDeviceIsActiveRadioButton.state == NSControlStateValueOn) {
-        caption = @"最省电，声音刚响起时可能被切掉一小截。";
+        caption = @"按需启动，开头可能有短暂延迟。";
     } else if (self.alwaysRadioButton.state == NSControlStateValueOn) {
-        caption = @"声音最稳，但可能会阻止电脑休眠。";
+        caption = @"随时可播放，可能影响自动睡眠。";
     }
     activityCaptionLabel.stringValue = caption;
 }
@@ -476,6 +503,18 @@ int onDevicesChanged(AudioObjectID inObjectID,
     return YES;
 }
 
+- (void)updateDriver:(id)sender {
+#pragma unused(sender)
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"更新驱动？";
+    alert.informativeText = @"更新会短暂中断声音，需要管理员密码。";
+    [alert addButtonWithTitle:@"更新"];
+    [alert addButtonWithTitle:@"取消"];
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        if (response == NSAlertFirstButtonReturn) [self installDriver];
+    }];
+}
+
 - (void)installDriver {
     NSString *src = [self bundledDriverPath];
     if (src.length == 0) {
@@ -486,11 +525,13 @@ int onDevicesChanged(AudioObjectID inObjectID,
         return;
     }
 
+    NSString *escapedSource = [[src stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+        stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
     NSString *source = [NSString stringWithFormat:
         @"set src to quoted form of \"%@\"\n"
          "set dst to quoted form of \"%@\"\n"
          "do shell script \"rm -rf \" & dst & \" && cp -R \" & src & \" \" & dst & \" && chown -R root:wheel \" & dst & \" && killall coreaudiod\" with administrator privileges",
-        src,
+        escapedSource,
         kHALDriverPath];
 
     NSString *errorMessage = nil;
@@ -504,15 +545,14 @@ int onDevicesChanged(AudioObjectID inObjectID,
         return;
     }
 
-    initializationAttemptInterval = 3;
     [self updateDriverStatus];
-    [self keepTryingToInitializeUntilSuccess];
+    [self initialize];
 }
 
 - (void)uninstallDriver {
     NSAlert *confirm = [[NSAlert alloc] init];
     confirm.messageText = @"卸载驱动？";
-    confirm.informativeText = @"系统将不再显示 Proxy Audio Device。需要管理员密码。";
+    confirm.informativeText = @"移除虚拟音频输出，需要管理员密码。";
     [confirm addButtonWithTitle:@"卸载"];
     [confirm addButtonWithTitle:@"取消"];
     if ([confirm runModal] != NSAlertFirstButtonReturn) {
@@ -546,7 +586,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
     AudioDeviceID proxyAudioBox = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
     AudioDevice::setIdentifyValue(proxyAudioBox, -((SInt32)ProxyAudioDevice::ConfigType::deviceName));
     NSString *result = (__bridge_transfer NSString *)AudioDevice::copyObjectName(proxyAudioBox);
-    return result ? result : @"Proxy Audio Device";
+    return result ? result : @"Display Volume";
 }
 
 - (IBAction)deviceNameEntered:(id)sender {
@@ -562,13 +602,23 @@ int onDevicesChanged(AudioObjectID inObjectID,
 
 - (NSString *)readConfigValueForType:(ProxyAudioDevice::ConfigType)type {
     AudioDeviceID proxyAudioBox = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
-    AudioDevice::setIdentifyValue(proxyAudioBox, -((SInt32)type));
+    if (![self setCurrentProcessAsConfigurator]) return nil;
+    if (!AudioDevice::setIdentifyValue(proxyAudioBox, -((SInt32)type))) return nil;
     return (__bridge_transfer NSString *)AudioDevice::copyObjectName(proxyAudioBox);
 }
 
-- (void)writeConfigString:(NSString *)keyValue {
+- (BOOL)writeConfigString:(NSString *)keyValue {
     AudioDeviceID proxyAudioBox = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
-    AudioDevice::setObjectName(proxyAudioBox, (__bridge CFStringRef)keyValue);
+    if (![self setCurrentProcessAsConfigurator]) return NO;
+    OSStatus error = AudioDevice::setObjectName(proxyAudioBox, (__bridge CFStringRef)keyValue);
+    if (error != noErr) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"设置未保存";
+        alert.informativeText = @"驱动暂时不可用，请稍后重试。";
+        [alert beginSheetModalForWindow:self.window completionHandler:nil];
+        return NO;
+    }
+    return YES;
 }
 
 - (NSString *)currentOutputDeviceUID {
@@ -615,12 +665,62 @@ int onDevicesChanged(AudioObjectID inObjectID,
 }
 
 - (void)pollRefresh {
-    if (self.window.isVisible) {
+    if (!self.window.isVisible) return;
+    AudioDeviceID box = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
+    if (box == kAudioObjectUnknown || box != configuredBox || self.settingsContainer.hidden) {
+        [self initialize];
+    } else {
+        // coreaudiod can restart and reuse an object ID: renew the configurator identity.
+        [self setCurrentProcessAsConfigurator];
+        [self refreshOutputDevices];
         [self updateDriverStatus];
-        if ([self proxyAudioDeviceAvailable]) {
-            [self refreshOutputDevices];
+        NSString *actual = [self readConfigValueForType:ProxyAudioDevice::ConfigType::outputActualBufferSize];
+        bufferHint.stringValue = actual.intValue > 0
+            ? [NSString stringWithFormat:@"当前缓冲 %@ 帧。默认 512。", actual]
+            : @"缓冲越大，播放越稳。默认 512。";
+    }
+}
+
+- (void)refreshBufferChoices {
+    NSString *uid = [self currentOutputDeviceUID];
+    AudioDeviceID device = uid.length ? AudioDevice::audioDeviceIDForDeviceUID((__bridge CFStringRef)uid) : kAudioObjectUnknown;
+    AudioValueRange range = {128, 2048};
+    UInt32 size = sizeof(range);
+    AudioObjectPropertyAddress address = {kAudioDevicePropertyBufferFrameSizeRange,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+    if (device != kAudioObjectUnknown) {
+        AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, &range);
+    }
+    [self.bufferSizePopUp removeAllItems];
+    NSString *selected = [self currentOutputDeviceBufferFrameSize];
+    for (NSNumber *frames in @[@128, @256, @512, @1024, @2048]) {
+        if (frames.doubleValue >= range.mMinimum && frames.doubleValue <= range.mMaximum) {
+            [self.bufferSizePopUp addItemWithTitle:frames.stringValue];
         }
     }
+    if (self.bufferSizePopUp.numberOfItems == 0 && range.mMinimum > 0) {
+        [self.bufferSizePopUp addItemWithTitle:[NSString stringWithFormat:@"%.0f", range.mMinimum]];
+    }
+    if (selected.intValue > 0 && ![self.bufferSizePopUp itemWithTitle:selected]) {
+        [self.bufferSizePopUp addItemWithTitle:selected];
+        [self.bufferSizePopUp itemWithTitle:selected].enabled = NO;
+    }
+    [self.bufferSizePopUp selectItemWithTitle:selected];
+}
+
+- (void)enableSystemOutput:(id)sender {
+#pragma unused(sender)
+    AudioDeviceID proxy = AudioDevice::audioDeviceIDForDeviceUID(CFSTR(kDevice_UID));
+    AudioObjectPropertyAddress address = {kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+    OSStatus error = AudioObjectSetPropertyData(kAudioObjectSystemObject, &address, 0, nullptr, sizeof(proxy), &proxy);
+    if (error != noErr) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"暂时无法启用";
+        alert.informativeText = @"请在声音设置中选择本应用的虚拟输出。";
+        [alert beginSheetModalForWindow:self.window completionHandler:nil];
+    }
+    [self updateDriverStatus];
 }
 
 - (NSString *)currentDeviceListSignature {
@@ -644,13 +744,14 @@ int onDevicesChanged(AudioObjectID inObjectID,
         return true;
     }
     lastDeviceListSignature = signature;
+    [self refreshBufferChoices];
 
     [self.outputDevicePopUp removeAllItems];
     std::vector<AudioDeviceID> devices = AudioDevice::devicesWithOutputCapabilitiesThatAreNotProxyAudioDevice();
     currentDeviceList.clear();
     NSString *storedUID = [self currentOutputDeviceUID];
     bool foundStoredDevice = false;
-    bool success = false;
+    bool success = true;
 
     for (AudioDeviceID device : devices) {
         NSString *deviceName = (__bridge_transfer NSString *)AudioDevice::copyObjectName(device);
@@ -679,6 +780,12 @@ int onDevicesChanged(AudioObjectID inObjectID,
         success = true;
     }
 
+    if (currentDeviceList.empty()) {
+        [self.outputDevicePopUp addItemWithTitle:@"暂无输出设备"];
+        self.outputDevicePopUp.enabled = NO;
+    } else {
+        self.outputDevicePopUp.enabled = YES;
+    }
     return success;
 }
 
@@ -710,7 +817,9 @@ int onDevicesChanged(AudioObjectID inObjectID,
     if (!size) {
         return;
     }
-    [self writeConfigString:[NSString stringWithFormat:@"outputDeviceBufferFrameSize=%@", size]];
+    if (![self writeConfigString:[NSString stringWithFormat:@"outputDeviceBufferFrameSize=%@", size]]) {
+        [self refreshBufferChoices];
+    }
 }
 
 - (ProxyAudioDevice::ActiveCondition)currentOutputDeviceActiveCondition {

@@ -68,6 +68,15 @@ OSStatus AudioDevice::updateStreamInfo() {
         return err;
     }
 
+    UInt32 channels[2] = {1, 2};
+    UInt32 size = sizeof(channels);
+    AudioObjectPropertyAddress address = {kAudioDevicePropertyPreferredChannelsForStereo,
+        kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMaster};
+    if (AudioObjectGetPropertyData(id, &address, 0, nullptr, &size, channels) == noErr
+        && channels[0] && channels[1] && channels[0] != channels[1]) {
+        stereoChannels[0] = channels[0] - 1;
+        stereoChannels[1] = channels[1] - 1;
+    }
     return noErr;
 }
 
@@ -164,7 +173,10 @@ void AudioDevice::setBufferFrameSize(UInt32 newBufferFrameSize) {
         AudioObjectSetPropertyData(id, &propertyAddress, 0, NULL, sizeof(bufferFrameSize), &newBufferFrameSize);
 
     if (err == noErr) {
-        bufferFrameSize = newBufferFrameSize;
+        // Devices may round a request; always use the actual frame count.
+        getIntegerPropertyData(bufferFrameSize, kAudioDevicePropertyBufferFrameSize,
+            isOutput ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput,
+            kAudioObjectPropertyElementMaster);
     } else {
         syslog(LOG_WARNING, "ProxyAudio: error: failed to set buffer frame size of device %u", id);
     }
@@ -323,10 +335,10 @@ CFStringRef AudioDevice::copyObjectName(AudioObjectID device) {
     return (error == noErr) ? name : nullptr;
 }
 
-void AudioDevice::setObjectName(AudioObjectID object, CFStringRef newName) {
+OSStatus AudioDevice::setObjectName(AudioObjectID object, CFStringRef newName) {
     AudioObjectPropertyAddress setNameAddr = {
         kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
-    AudioObjectSetPropertyData(object, &setNameAddr, 0, NULL, sizeof(newName), &newName);
+    return AudioObjectSetPropertyData(object, &setNameAddr, 0, NULL, sizeof(newName), &newName);
 }
 
 AudioDeviceID AudioDevice::audioDeviceIDForUID(CFStringRef uid, AudioObjectPropertySelector selector) {

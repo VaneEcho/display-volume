@@ -45,7 +45,9 @@ class ProxyAudioDevice {
         deviceActiveCondition,
         deviceHideWhenUnavailable,
         outputDeviceOfflineFallback,
-        outputDeviceDisplayName
+        outputDeviceDisplayName,
+        outputRuntimeState,
+        outputActualBufferSize
     };
     enum class ActiveCondition { proxiedDeviceActive = 0, userActive = 1, always = 2 };
 
@@ -511,6 +513,11 @@ class ProxyAudioDevice {
     Byte *workBuffer = NULL;
     AudioDevice outputDevice;
     bool outputDeviceReady = false;
+    UInt32 configuredBufferRequest = 0;
+    std::atomic<UInt32> runtimeState{0}; // 0 connecting, 1 ready, 2 running
+    std::atomic<UInt32> actualBufferSize{0};
+    Float32 previousGainL = 0.0f, previousGainR = 0.0f;
+    std::atomic<UInt32> bufferOverrunCount{0};
     std::atomic_bool inputIOIsActive;
     Float64 lastInputFrameTime = -1;
     Float64 lastInputBufferFrameSize = -1;

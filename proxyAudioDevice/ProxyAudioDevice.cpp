@@ -1,6 +1,8 @@
 #include "ProxyAudioDevice.h"
 
 #include <algorithm>
+#include <cmath>
+#include "AudioDSP.h"
 #include <string>
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
@@ -25,14 +27,12 @@ std::string CFStringToStdString(CFStringRef s) {
         return std::string("<null>");
     }
     
-    char *buffer;
-    size_t length = CFStringGetLength(s) + 1;
-    buffer = new char[length];
-    CFStringGetCString(s, buffer, length, kCFStringEncodingUTF8);
-    std::string result(buffer);
-    delete buffer;
-    
-    return result;
+    CFIndex size = CFStringGetMaximumSizeForEncoding(CFStringGetLength(s), kCFStringEncodingUTF8) + 1;
+    std::vector<char> buffer(static_cast<size_t>(size));
+    if (!CFStringGetCString(s, buffer.data(), size, kCFStringEncodingUTF8)) {
+        return std::string();
+    }
+    return std::string(buffer.data());
 }
 
 static std::vector<std::string> splitOnColon(const std::string &s) {
@@ -4984,7 +4984,7 @@ int ProxyAudioDevice::outputDeviceSampleRateListener(AudioObjectID inObjectID,
 #pragma unused(inNumberAddresses)
 #pragma unused(inAddresses)
     DebugMsg("ProxyAudio: outputDeviceSampleRateListener, will match sample rate");
-    matchOutputDeviceSampleRate();
+    ExecuteInAudioOutputThread(^{ matchOutputDeviceSampleRate(); });
 
     return noErr;
 }
@@ -5017,6 +5017,7 @@ void ProxyAudioDevice::updateOutputDeviceStartedState() {
     static bool userIsActivePrevious = false;
     
     if (!outputDevice.isValid()) {
+        runtimeState = 0;
         return;
     }
 
@@ -5053,7 +5054,7 @@ void ProxyAudioDevice::updateOutputDeviceStartedState() {
         outputDevice.stop();
         resetInputData();
     }
-
+    runtimeState = outputDeviceReady && (!shouldStart || outputDevice.isStarted) ? (outputDevice.isStarted ? 2 : 1) : 0;
 }
 
 void ProxyAudioDevice::matchOutputDeviceSampleRateNoLock() {
@@ -5065,7 +5066,8 @@ void ProxyAudioDevice::matchOutputDeviceSampleRateNoLock() {
     }
 
     Float64 currentInputSampleRate;
-    OSStatus err = outputDevice.getDoublePropertyData(outputDevice.sampleRate,
+    Float64 physicalSampleRate = 0;
+    OSStatus err = outputDevice.getDoublePropertyData(physicalSampleRate,
                                                       kAudioDevicePropertyNominalSampleRate,
                                                       kAudioObjectPropertyScopeGlobal,
                                                       kAudioObjectPropertyElementMaster);
@@ -5080,7 +5082,7 @@ void ProxyAudioDevice::matchOutputDeviceSampleRateNoLock() {
         currentInputSampleRate = gDevice_SampleRate;
     }
     
-    if (currentInputSampleRate == outputDevice.sampleRate) {
+    if (currentInputSampleRate == physicalSampleRate && outputDevice.sampleRate == physicalSampleRate) {
         outputDeviceReady = true;
         updateOutputDeviceStartedState();
         notifyHiddenPropertyChanged();
@@ -5097,8 +5099,14 @@ void ProxyAudioDevice::matchOutputDeviceSampleRateNoLock() {
     notifyHiddenPropertyChanged();
 
     resetInputData();
-    outputDevice.updateStreamInfo();
+    if (outputDevice.updateStreamInfo() != noErr) return;
 
+    if (currentInputSampleRate == outputDevice.sampleRate) {
+        outputDeviceReady = true;
+        updateOutputDeviceStartedState();
+        notifyHiddenPropertyChanged();
+        return;
+    }
     if (!contains(gDevice_SampleRates, outputDevice.sampleRate)) {
         syslog(LOG_WARNING, "ProxyAudio: output device using unavailable sample rate, cannot play!");
         return;
@@ -5130,8 +5138,16 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
              preferredDevice.id);
     CAMutex::Locker locker(outputDeviceMutex);
 
+    UInt32 requestedBufferSize;
+    {
+        CAMutex::Locker stateLocker(stateMutex);
+        requestedBufferSize = outputDeviceBufferFrameSize;
+    }
     if (outputDevice.isValid() && outputDevice.id == newOutputDevice.id
-        && outputDevice.bufferFrameSize == outputDeviceBufferFrameSize) {
+        && outputDevice.procId != nullptr && outputDeviceReady
+        && configuredBufferRequest == requestedBufferSize
+        && outputDevice.bufferFrameSize == newOutputDevice.bufferFrameSize
+        && outputDevice.sampleRate == newOutputDevice.sampleRate) {
         DebugMsg("ProxyAudio: setupTargetOutputDevice no change in device");
         if (!preferredDevice.isValid()) {
             scheduleTargetDeviceRetry(generation);
@@ -5149,8 +5165,18 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
         DebugMsg("ProxyAudio: setupTargetOutputDevice setting up new device");
         resetInputData();
         outputDevice = newOutputDevice;
-        outputDevice.setBufferFrameSize(outputDeviceBufferFrameSize);
+        outputDevice.setBufferFrameSize(requestedBufferSize);
+        configuredBufferRequest = requestedBufferSize;
+        actualBufferSize = outputDevice.bufferFrameSize;
+        if (outputDevice.bufferFrameSize == 0 || outputDevice.bufferFrameSize > kDevice_RingBufferSize * 2) {
+            outputDevice.invalidate();
+            return;
+        }
         outputDevice.setupIOProc(outputDeviceIOProcStatic, this);
+        if (!outputDevice.procId) {
+            outputDevice.invalidate();
+            return; // The watchdog will retry incomplete initialization.
+        }
         outputDevice.addPropertyListener(kAudioDevicePropertyDeviceIsAlive,
                                          kAudioObjectPropertyScopeGlobal,
                                          kAudioObjectPropertyElementMaster,
@@ -5201,6 +5227,8 @@ void ProxyAudioDevice::startTargetDeviceWatchdog() {
                               kTargetDeviceRetryIntervalNs,
                               250ull * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(targetDeviceWatchdogTimer, ^{
+        const auto overruns = bufferOverrunCount.exchange(0, std::memory_order_relaxed);
+        if (overruns) syslog(LOG_WARNING, "ProxyAudio: %u output underruns in the last interval", overruns);
         DebugMsg("ProxyAudio: target device watchdog firing");
         setupTargetOutputDevice();
     });
@@ -5226,6 +5254,8 @@ void ProxyAudioDevice::initializeOutputDevice() {
 
 void ProxyAudioDevice::deinitializeOutputDeviceNoLock() {
     DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock");
+    runtimeState = 0;
+    actualBufferSize = 0;
     if (outputDevice.isValid()) {
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock stopping device");
         outputDevice.stop();
@@ -5233,6 +5263,12 @@ void ProxyAudioDevice::deinitializeOutputDeviceNoLock() {
         notifyHiddenPropertyChanged();
 
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock removing IO proc");
+        for (auto selector : {kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate}) {
+            AudioObjectPropertyAddress address = {selector, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+            AudioObjectRemovePropertyListener(outputDevice.id, &address,
+                selector == kAudioDevicePropertyDeviceIsAlive ? outputDeviceAliveListenerStatic : outputDeviceSampleRateListenerStatic,
+                this);
+        }
         outputDevice.destroyIOProc();
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock invalidating");
         outputDevice.invalidate();
@@ -5283,6 +5319,7 @@ void ProxyAudioDevice::resetInputData() {
         inputBuffer->Clear();
     }
 
+    previousGainL = previousGainR = 0.0f;
     lastInputFrameTime = -1;
     lastInputBufferFrameSize = -1;
     inputOutputSampleDelta = -1;
@@ -5342,7 +5379,10 @@ OSStatus ProxyAudioDevice::StopIO(AudioServerPlugInDriverRef inDriver,
 
 #pragma unused(inClientID)
     DebugMsg("ProxyAudio: StopIO");
-    inputFinalFrameTime = lastInputFrameTime + lastInputBufferFrameSize;
+    {
+        CAMutex::Locker ioLocker(IOMutex);
+        inputFinalFrameTime = lastInputFrameTime + lastInputBufferFrameSize;
+    }
 
     //    declare the local variables
     OSStatus theAnswer = 0;
@@ -5618,6 +5658,9 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     // while it is not playing.
     Float64 currentOutputDeviceSampleRate = outputDevice.sampleRate;
     UInt32 currentOutputDeviceBufferFrameSize = outputDevice.bufferFrameSize;
+    if (currentOutputDeviceBufferFrameSize == 0 || currentOutputDeviceBufferFrameSize > kDevice_RingBufferSize * 2) {
+        return noErr;
+    }
     UInt32 currentOutputDeviceSafetyOffset = outputDevice.safetyOffset;
     Float64 currentInputDeviceSampleRate;
     UInt32 currentInputDeviceChannelCount;
@@ -5688,40 +5731,27 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     if (overrun && inputFinalFrameTime == -1 && startFrame >= inputBuffer->mStartFrame) {
         // Since this warning could conceivably happen every cycle, explicitly make it
         // only appear once every five seconds at most
-        static time_t lastBufferOverrunWarning = 0;
-        time_t seconds;
-        time(&seconds);
-        
-        if ((seconds - lastBufferOverrunWarning) > 5) {
-            lastBufferOverrunWarning = seconds;
-            syslog(LOG_WARNING, "ProxyAudio: output unexpected overrun");
-            syslog(LOG_WARNING, "ProxyAudio: output frame: %lf", startFrame);
-            syslog(LOG_WARNING,
-                   "ProxyAudio: output buffer start: %llu    end: %llu",
-                   inputBuffer->mStartFrame,
-                   inputBuffer->mEndFrame);
-        }
+        // Reporting happens on the control queue, never on the realtime callback.
+        bufferOverrunCount.fetch_add(1, std::memory_order_relaxed);
     }
     
     Float32 volumeFactorL = 1.0, volumeFactorR = 1.0;
     calculateVolumeFactors(currentVolumeL, currentVolumeR, currentMute, volumeFactorL, volumeFactorR);
 
-    for (UInt32 bufferIndex = 0; bufferIndex < outOutputData->mNumberBuffers; bufferIndex++) {
-        UInt32 outputChannelCount = outOutputData->mBuffers[bufferIndex].mNumberChannels;
-        UInt32 numChannelsToProcess = std::min(outputChannelCount, currentInputDeviceChannelCount);
-
-        for (UInt32 channelIndex = 0; channelIndex < numChannelsToProcess; channelIndex++) {
-            Float32 *in = (Float32 *)workBuffer + channelIndex;
-            Float32 *out = (Float32 *)outOutputData->mBuffers[bufferIndex].mData + channelIndex;
-            long framesize = outputChannelCount * sizeof(Float32);
-
-            for (UInt32 frame = 0; frame < outOutputData->mBuffers[bufferIndex].mDataByteSize; frame += framesize) {
-                *out += (*in * ((channelIndex == 0) ? volumeFactorL : volumeFactorR));
-                in += currentInputDeviceChannelCount;
-                out += outputChannelCount;
-            }
-        }
+    // Smooth gain over 5 ms. Advance once per frame, independently of buffer layout.
+    const UInt32 rampFrames = std::max<UInt32>(1, currentInputDeviceSampleRate * 0.005);
+    UInt32 channelOffset = 0;
+    for (UInt32 bufferIndex = 0; bufferIndex < outOutputData->mNumberBuffers; ++bufferIndex) {
+        AudioBuffer &buffer = outOutputData->mBuffers[bufferIndex];
+        ProxyAudioDSP::mixStereo((const float *)workBuffer, currentOutputDeviceBufferFrameSize,
+            (float *)buffer.mData, buffer.mDataByteSize / sizeof(float), buffer.mNumberChannels,
+            channelOffset, outputDevice.stereoChannels[0], outputDevice.stereoChannels[1],
+            previousGainL, previousGainR, volumeFactorL, volumeFactorR, rampFrames);
+        channelOffset += buffer.mNumberChannels;
     }
+    const float progress = std::min(1.0f, (float)currentOutputDeviceBufferFrameSize / rampFrames);
+    previousGainL += (volumeFactorL - previousGainL) * progress;
+    previousGainR += (volumeFactorR - previousGainR) * progress;
 
     return noErr;
 }
@@ -5731,21 +5761,8 @@ void ProxyAudioDevice::calculateVolumeFactors(Float32 volumeL,
                                               bool mute,
                                               Float32 &volumeFactorL,
                                               Float32 &volumeFactorR) {
-    if (volumeL <= 0.0 || mute) {
-        volumeFactorL = 0.0;
-    } else if (volumeL >= 1.0) {
-        volumeFactorL = 1.0;
-    } else {
-        volumeFactorL = pow(10, (volumeL * (kVolume_MaxDB - kVolume_MinDB) + kVolume_MinDB) / 10);
-    }
-
-    if (volumeR <= 0.0 || mute) {
-        volumeFactorR = 0.0;
-    } else if (volumeR >= 1.0) {
-        volumeFactorR = 1.0;
-    } else {
-        volumeFactorR = pow(10, (volumeR * (kVolume_MaxDB - kVolume_MinDB) + kVolume_MinDB) / 10);
-    }
+    volumeFactorL = ProxyAudioDSP::gain(volumeL, mute, kVolume_MinDB, kVolume_MaxDB);
+    volumeFactorR = ProxyAudioDSP::gain(volumeR, mute, kVolume_MinDB, kVolume_MaxDB);
 }
 
 OSStatus ProxyAudioDevice::EndIOOperation(AudioServerPlugInDriverRef inDriver,
@@ -5851,7 +5868,7 @@ CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
     
     switch (type) {
         case ConfigType::outputDevice:
-            return CFStringCreateCopy(NULL, outputDeviceUID);
+            return outputDeviceUID ? CFStringCreateCopy(NULL, outputDeviceUID) : CFSTR("");
             
         case ConfigType::outputDeviceBufferFrameSize:
             return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceBufferFrameSize);
@@ -5868,6 +5885,10 @@ CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
         case ConfigType::outputDeviceOfflineFallback:
             return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceOfflineFallback ? 1 : 0);
 
+        case ConfigType::outputRuntimeState:
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), runtimeState.load());
+        case ConfigType::outputActualBufferSize:
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), actualBufferSize.load());
         case ConfigType::outputDeviceDisplayName:
             if (outputDeviceName) {
                 return CFStringCreateCopy(NULL, outputDeviceName);
@@ -5900,11 +5921,11 @@ CFStringRef ProxyAudioDevice::copyDeviceNameFromStorage()
     if (result == NULL) {
         CFBundleRef bundle = CFBundleGetBundleWithIdentifier(CFSTR(kPlugIn_BundleID));
         result = CFBundleCopyLocalizedString(
-            bundle, CFSTR("DeviceName"), CFSTR("Proxy Audio Device"), CFSTR("Localizable"));
+            bundle, CFSTR("DeviceName"), CFSTR("Display Volume"), CFSTR("Localizable"));
     }
 
     if (result == NULL) {
-        result = CFStringCreateCopy(NULL, CFSTR("Proxy Audio Device"));
+        result = CFStringCreateCopy(NULL, CFSTR("Display Volume"));
     }
     
     DebugMsg("ProxyAudio: copyDeviceNameFromStorage finished");
