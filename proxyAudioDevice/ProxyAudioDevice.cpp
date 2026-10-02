@@ -4958,6 +4958,7 @@ int ProxyAudioDevice::outputDeviceAliveListener(AudioObjectID inObjectID,
 #pragma unused(inAddresses)
 
     DebugMsg("ProxyAudio: outputDeviceAliveListener");
+    targetDeviceNeedsReset.store(true, std::memory_order_release);
     ExecuteInAudioOutputThread(^() {
         setupTargetOutputDevice();
     });
@@ -5136,6 +5137,7 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
     DebugMsg("ProxyAudio: setupTargetOutputDevice newOutputDevice: %d preferred: %d",
              newOutputDevice.id,
              preferredDevice.id);
+    const bool forceRebuild = targetDeviceNeedsReset.exchange(false, std::memory_order_acq_rel);
     CAMutex::Locker locker(outputDeviceMutex);
 
     UInt32 requestedBufferSize;
@@ -5143,7 +5145,7 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
         CAMutex::Locker stateLocker(stateMutex);
         requestedBufferSize = outputDeviceBufferFrameSize;
     }
-    if (outputDevice.isValid() && outputDevice.id == newOutputDevice.id
+    if (!forceRebuild && outputDevice.isValid() && outputDevice.id == newOutputDevice.id
         && outputDevice.procId != nullptr && outputDeviceReady
         && configuredBufferRequest == requestedBufferSize
         && outputDevice.bufferFrameSize == newOutputDevice.bufferFrameSize
@@ -5186,6 +5188,18 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
                                          kAudioObjectPropertyScopeGlobal,
                                          kAudioObjectPropertyElementMaster,
                                          outputDeviceSampleRateListenerStatic,
+                                         this);
+        // HDR/EDID changes can rebuild the HDMI stream while keeping the device UID,
+        // device ID, and nominal sample rate unchanged. Recreate the IO proc in that case.
+        outputDevice.addPropertyListener(kAudioDevicePropertyStreams,
+                                         kAudioObjectPropertyScopeGlobal,
+                                         kAudioObjectPropertyElementMaster,
+                                         outputDeviceAliveListenerStatic,
+                                         this);
+        outputDevice.addPropertyListener(kAudioDevicePropertyStreamConfiguration,
+                                         kAudioObjectPropertyScopeOutput,
+                                         kAudioObjectPropertyElementMaster,
+                                         outputDeviceAliveListenerStatic,
                                          this);
         DebugMsg("ProxyAudio: setupTargetOutputDevice will match sample rate");
         matchOutputDeviceSampleRateNoLock();
@@ -5263,11 +5277,15 @@ void ProxyAudioDevice::deinitializeOutputDeviceNoLock() {
         notifyHiddenPropertyChanged();
 
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock removing IO proc");
-        for (auto selector : {kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate}) {
-            AudioObjectPropertyAddress address = {selector, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
-            AudioObjectRemovePropertyListener(outputDevice.id, &address,
-                selector == kAudioDevicePropertyDeviceIsAlive ? outputDeviceAliveListenerStatic : outputDeviceSampleRateListenerStatic,
-                this);
+        const AudioObjectPropertyAddress listeners[] = {
+            {kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster},
+            {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster},
+            {kAudioDevicePropertyStreams, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster},
+            {kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMaster},
+        };
+        for (size_t i = 0; i < sizeof(listeners) / sizeof(listeners[0]); ++i) {
+            AudioObjectRemovePropertyListener(outputDevice.id, &listeners[i],
+                i == 1 ? outputDeviceSampleRateListenerStatic : outputDeviceAliveListenerStatic, this);
         }
         outputDevice.destroyIOProc();
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock invalidating");

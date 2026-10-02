@@ -534,6 +534,7 @@ class ProxyAudioDevice {
     UInt32 outputDeviceTransportType = 0;
     bool outputDeviceOfflineFallback = kOutputDeviceDefaultOfflineFallback;
     std::atomic<int> targetDeviceSearchGeneration{0};
+    std::atomic_bool targetDeviceNeedsReset{false};
     dispatch_source_t targetDeviceWatchdogTimer = NULL;
     UInt32 outputDeviceBufferFrameSize = kOutputDeviceDefaultBufferFrameSize;
     SInt64 smallestFramesToBufferEnd = -1;
