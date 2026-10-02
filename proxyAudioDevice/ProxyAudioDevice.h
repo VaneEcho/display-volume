@@ -82,11 +82,8 @@ class ProxyAudioDevice {
                             const AudioObjectPropertyAddress *inAddresses);
     void setupAudioDevicesListener();
     void setupTargetOutputDevice();
-    void addOutputStreamListeners();
-    void removeOutputStreamListeners();
-    void scheduleOutputDeviceRebuild();
+    void scheduleOutputDeviceRebuild(AudioObjectPropertySelector reason = 0);
     void scheduleTargetDeviceRetry(int generation);
-    void startTargetDeviceWatchdog();
     void initializeOutputDevice();
     void deinitializeOutputDeviceNoLock();
     void deinitializeOutputDevice();
@@ -515,15 +512,11 @@ class ProxyAudioDevice {
     AudioRingBuffer *inputBuffer = NULL;
     Byte *workBuffer = NULL;
     AudioDevice outputDevice;
-    std::vector<AudioStreamID> outputStreamsWithListeners;
     bool outputDeviceReady = false;
     UInt32 configuredBufferRequest = 0;
     std::atomic<UInt32> runtimeState{0}; // 0 connecting, 1 ready, 2 running
     std::atomic<UInt32> actualBufferSize{0};
     Float32 previousGainL = 0.0f, previousGainR = 0.0f;
-    std::atomic<UInt32> bufferOverrunCount{0};
-    std::atomic<UInt64> outputIOProcCallbackCount{0};
-    UInt64 lastOutputIOProcCallbackCount = 0;
     std::atomic_bool inputIOIsActive;
     Float64 lastInputFrameTime = -1;
     Float64 lastInputBufferFrameSize = -1;
@@ -542,7 +535,6 @@ class ProxyAudioDevice {
     std::atomic<int> targetDeviceSearchGeneration{0};
     std::atomic_bool targetDeviceNeedsReset{false};
     std::atomic<int> outputDeviceChangeGeneration{0};
-    dispatch_source_t targetDeviceWatchdogTimer = NULL;
     UInt32 outputDeviceBufferFrameSize = kOutputDeviceDefaultBufferFrameSize;
     SInt64 smallestFramesToBufferEnd = -1;
     Float64 outputAccumulatedRateRatio = 0.0;

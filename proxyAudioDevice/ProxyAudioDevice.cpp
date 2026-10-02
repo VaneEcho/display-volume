@@ -6,6 +6,7 @@
 #include <string>
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
+#include <os/log.h>
 
 #include "AudioDevice.h"
 #include "AudioRingBuffer.h"
@@ -693,7 +694,6 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     outputDeviceActiveCondition = retrieveOutputDeviceActiveConditionFromStorage();
     outputDeviceHideWhenUnavailable = retrieveOutputDeviceHideWhenUnavailableFromStorage();
     outputDeviceOfflineFallback = retrieveOutputDeviceOfflineFallbackFromStorage();
-    startTargetDeviceWatchdog();
 
     //    calculate the host ticks per frame
     struct mach_timebase_info theTimeBaseInfo;
@@ -4958,7 +4958,7 @@ int ProxyAudioDevice::outputDeviceAliveListener(AudioObjectID inObjectID,
 #pragma unused(inAddresses)
 
     DebugMsg("ProxyAudio: output device state/configuration changed");
-    scheduleOutputDeviceRebuild();
+    scheduleOutputDeviceRebuild(inNumberAddresses ? inAddresses[0].mSelector : 0);
 
     return noErr;
 }
@@ -5172,13 +5172,14 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
         actualBufferSize = outputDevice.bufferFrameSize;
         if (outputDevice.bufferFrameSize == 0 || outputDevice.bufferFrameSize > kDevice_RingBufferSize * 2) {
             outputDevice.invalidate();
+            scheduleTargetDeviceRetry(generation);
             return;
         }
         outputDevice.setupIOProc(outputDeviceIOProcStatic, this);
-        lastOutputIOProcCallbackCount = outputIOProcCallbackCount.load(std::memory_order_acquire);
         if (!outputDevice.procId) {
             outputDevice.invalidate();
-            return; // The watchdog will retry incomplete initialization.
+            scheduleTargetDeviceRetry(generation);
+            return;
         }
         outputDevice.addPropertyListener(kAudioDevicePropertyDeviceIsAlive,
                                          kAudioObjectPropertyScopeGlobal,
@@ -5190,10 +5191,20 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
                                          kAudioObjectPropertyElementMaster,
                                          outputDeviceSampleRateListenerStatic,
                                          this);
-        // HDR/EDID changes can rebuild the HDMI stream while keeping the device UID,
-        // device ID, and nominal sample rate unchanged. Recreate the IO proc in that case.
-        outputDevice.addPropertyListener(kAudioDevicePropertyStreams,
+        // LG HDMI emits DeviceHasChanged ('diff') on HDR transitions even when
+        // its UID, stream format, channel layout and sample rate stay unchanged.
+        outputDevice.addPropertyListener(kAudioDevicePropertyDeviceHasChanged,
                                          kAudioObjectPropertyScopeGlobal,
+                                         kAudioObjectPropertyElementMaster,
+                                         outputDeviceAliveListenerStatic,
+                                         this);
+        outputDevice.addPropertyListener(kAudioDevicePropertyIOStoppedAbnormally,
+                                         kAudioObjectPropertyScopeGlobal,
+                                         kAudioObjectPropertyElementMaster,
+                                         outputDeviceAliveListenerStatic,
+                                         this);
+        outputDevice.addPropertyListener(kAudioDevicePropertyStreams,
+                                         kAudioObjectPropertyScopeOutput,
                                          kAudioObjectPropertyElementMaster,
                                          outputDeviceAliveListenerStatic,
                                          this);
@@ -5202,7 +5213,6 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
                                          kAudioObjectPropertyElementMaster,
                                          outputDeviceAliveListenerStatic,
                                          this);
-        addOutputStreamListeners();
         DebugMsg("ProxyAudio: setupTargetOutputDevice will match sample rate");
         matchOutputDeviceSampleRateNoLock();
         if (preferredDevice.isValid() && preferredDevice.id == newOutputDevice.id) {
@@ -5219,65 +5229,12 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
 
 static const uint64_t kOutputDeviceRebuildDebounceNs = 1200ull * NSEC_PER_MSEC;
 
-void ProxyAudioDevice::addOutputStreamListeners() {
-    removeOutputStreamListeners();
-    if (!outputDevice.isValid()) return;
-
-    AudioObjectPropertyAddress streamsAddress = {kAudioDevicePropertyStreams,
-                                                  kAudioObjectPropertyScopeOutput,
-                                                  kAudioObjectPropertyElementMaster};
-    UInt32 dataSize = 0;
-    OSStatus err = AudioObjectGetPropertyDataSize(outputDevice.id, &streamsAddress, 0, nullptr, &dataSize);
-    if (err != noErr || dataSize == 0) return;
-
-    std::vector<AudioStreamID> streams(dataSize / sizeof(AudioStreamID));
-    err = AudioObjectGetPropertyData(outputDevice.id, &streamsAddress, 0, nullptr, &dataSize, streams.data());
-    if (err != noErr) return;
-
-    const AudioObjectPropertySelector selectors[] = {
-        kAudioStreamPropertyPhysicalFormat,
-        kAudioStreamPropertyAvailablePhysicalFormats,
-        kAudioStreamPropertyIsActive,
-    };
-    for (AudioStreamID stream : streams) {
-        bool registered = false;
-        for (AudioObjectPropertySelector selector : selectors) {
-            AudioObjectPropertyAddress address = {selector,
-                                                   kAudioObjectPropertyScopeGlobal,
-                                                   kAudioObjectPropertyElementMaster};
-            err = AudioObjectAddPropertyListener(stream, &address, outputDeviceAliveListenerStatic, this);
-            if (err == noErr) {
-                registered = true;
-            } else if (err != kAudioHardwareUnknownPropertyError) {
-                syslog(LOG_WARNING, "ProxyAudio: failed to observe HDMI stream property %u (%d)", selector, err);
-            }
-        }
-        if (registered) outputStreamsWithListeners.push_back(stream);
-    }
-}
-
-void ProxyAudioDevice::removeOutputStreamListeners() {
-    const AudioObjectPropertySelector selectors[] = {
-        kAudioStreamPropertyPhysicalFormat,
-        kAudioStreamPropertyAvailablePhysicalFormats,
-        kAudioStreamPropertyIsActive,
-    };
-    for (AudioStreamID stream : outputStreamsWithListeners) {
-        for (AudioObjectPropertySelector selector : selectors) {
-            AudioObjectPropertyAddress address = {selector,
-                                                   kAudioObjectPropertyScopeGlobal,
-                                                   kAudioObjectPropertyElementMaster};
-            AudioObjectRemovePropertyListener(stream, &address, outputDeviceAliveListenerStatic, this);
-        }
-    }
-    outputStreamsWithListeners.clear();
-}
-
-void ProxyAudioDevice::scheduleOutputDeviceRebuild() {
+void ProxyAudioDevice::scheduleOutputDeviceRebuild(AudioObjectPropertySelector reason) {
     const int generation = ++outputDeviceChangeGeneration;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kOutputDeviceRebuildDebounceNs),
                    AudioOutputDispatchQueue(), ^{
         if (generation != outputDeviceChangeGeneration.load()) return;
+        os_log(OS_LOG_DEFAULT, "Display Volume: rebind after property 0x%{public}x", reason);
         targetDeviceNeedsReset.store(true, std::memory_order_release);
         setupTargetOutputDevice();
     });
@@ -5296,35 +5253,6 @@ void ProxyAudioDevice::scheduleTargetDeviceRetry(int generation) {
                        DebugMsg("ProxyAudio: target device retry firing");
                        setupTargetOutputDevice();
                    });
-}
-
-void ProxyAudioDevice::startTargetDeviceWatchdog() {
-    if (targetDeviceWatchdogTimer) {
-        return;
-    }
-
-    targetDeviceWatchdogTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, AudioOutputDispatchQueue());
-    const uint64_t watchdogIntervalNs = 2ull * NSEC_PER_SEC;
-    dispatch_source_set_timer(targetDeviceWatchdogTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, watchdogIntervalNs),
-                              watchdogIntervalNs,
-                              250ull * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(targetDeviceWatchdogTimer, ^{
-        const auto overruns = bufferOverrunCount.exchange(0, std::memory_order_relaxed);
-        if (overruns) syslog(LOG_WARNING, "ProxyAudio: %u output underruns in the last interval", overruns);
-        DebugMsg("ProxyAudio: target device watchdog firing");
-        const UInt64 callbackCount = outputIOProcCallbackCount.load(std::memory_order_acquire);
-        if (outputDevice.isValid() && outputDeviceReady && outputDevice.isStarted
-            && callbackCount == lastOutputIOProcCallbackCount) {
-            syslog(LOG_WARNING, "ProxyAudio: HDMI output IOProc stopped responding; rebuilding output connection");
-            targetDeviceNeedsReset.store(true, std::memory_order_release);
-            setupTargetOutputDevice();
-        } else if (!outputDevice.isValid()) {
-            setupTargetOutputDevice();
-        }
-        lastOutputIOProcCallbackCount = callbackCount;
-    });
-    dispatch_resume(targetDeviceWatchdogTimer);
 }
 
 void ProxyAudioDevice::initializeOutputDevice() {
@@ -5353,14 +5281,15 @@ void ProxyAudioDevice::deinitializeOutputDeviceNoLock() {
         outputDevice.stop();
         outputDeviceReady = false;
         notifyHiddenPropertyChanged();
-        removeOutputStreamListeners();
 
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock removing IO proc");
         const AudioObjectPropertyAddress listeners[] = {
             {kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster},
             {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster},
-            {kAudioDevicePropertyStreams, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster},
+            {kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMaster},
             {kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMaster},
+            {kAudioDevicePropertyDeviceHasChanged, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster},
+            {kAudioDevicePropertyIOStoppedAbnormally, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster},
         };
         for (size_t i = 0; i < sizeof(listeners) / sizeof(listeners[0]); ++i) {
             AudioObjectRemovePropertyListener(outputDevice.id, &listeners[i],
@@ -5426,96 +5355,51 @@ void ProxyAudioDevice::resetInputData() {
 OSStatus ProxyAudioDevice::StartIO(AudioServerPlugInDriverRef inDriver,
                                    AudioObjectID inDeviceObjectID,
                                    UInt32 inClientID) {
-#pragma unused(inDriver)
-#pragma unused(inDeviceObjectID)
-    //    This call tells the device that IO is starting for the given client. When this routine
-    //    returns, the device's clock is running and it is ready to have data read/written. It is
-    //    important to note that multiple clients can have IO running on the device at the same time.
-    //    So, work only needs to be done when the first client starts. All subsequent starts simply
-    //    increment the counter.
-    OSStatus theAnswer = 0;
-
 #pragma unused(inClientID)
-    
-    DebugMsg("ProxyAudio: StartIO");
-    resetInputData();
-
-    CAMutex::Locker locker(stateMutex);
-
-    //    figure out what we need to do
-    if (gDevice_IOIsRunning == UINT64_MAX) {
-        //    overflowing is an error
-        theAnswer = kAudioHardwareIllegalOperationError;
-    } else if (gDevice_IOIsRunning == 0) {
-        //    We need to start the hardware, which in this case is just anchoring the time line.
-        gDevice_IOIsRunning = 1;
-        gDevice_NumberTimeStamps = 0;
-        gDevice_AnchorSampleTime = 0;
-        gDevice_AnchorHostTime = mach_absolute_time();
-        gDevice_ElapsedTicks = 0;
-        outputAccumulatedRateRatio = 0.0;
-        outputAccumulatedRateRatioSamples = 0;
-    } else {
-        //    IO is already running, so just bump the counter
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device)
+        return kAudioHardwareBadObjectError;
+    {
+        // Match the callback's IO -> state lock order. A second client must not
+        // reset the timeline or discard audio that the first client is playing.
+        CAMutex::Locker ioLocker(IOMutex);
+        CAMutex::Locker stateLocker(stateMutex);
+        if (gDevice_IOIsRunning == UINT64_MAX) return kAudioHardwareIllegalOperationError;
+        if (gDevice_IOIsRunning == 0) {
+            resetInputData();
+            CAMutex::Locker timestampLocker(getZeroTimestampMutex);
+            gDevice_NumberTimeStamps = 0;
+            gDevice_AnchorSampleTime = 0;
+            gDevice_AnchorHostTime = mach_absolute_time();
+            gDevice_ElapsedTicks = 0;
+            outputAccumulatedRateRatio = 0.0;
+            outputAccumulatedRateRatioSamples = 0;
+        }
         ++gDevice_IOIsRunning;
+        inputIOIsActive = true;
     }
-    
-    inputIOIsActive = (gDevice_IOIsRunning > 0);
-    ExecuteInAudioOutputThread(^ () { updateOutputDeviceStartedState(); });
-    
-    DebugMsg("ProxyAudio: StartIO finished");
-    
-    return theAnswer;
+    ExecuteInAudioOutputThread(^{ updateOutputDeviceStartedState(); });
+    return noErr;
 }
 
 OSStatus ProxyAudioDevice::StopIO(AudioServerPlugInDriverRef inDriver,
                                   AudioObjectID inDeviceObjectID,
                                   UInt32 inClientID) {
-    //    This call tells the device that the client has stopped IO. The driver can stop the hardware
-    //    once all clients have stopped.
-
 #pragma unused(inClientID)
-    DebugMsg("ProxyAudio: StopIO");
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device)
+        return kAudioHardwareBadObjectError;
     {
         CAMutex::Locker ioLocker(IOMutex);
-        inputFinalFrameTime = lastInputFrameTime + lastInputBufferFrameSize;
+        CAMutex::Locker stateLocker(stateMutex);
+        if (gDevice_IOIsRunning == 0) return kAudioHardwareIllegalOperationError;
+        --gDevice_IOIsRunning;
+        inputIOIsActive = (gDevice_IOIsRunning > 0);
+        // Only the last client ends playback. Ending it for any client makes
+        // the output callback return silence forever while other clients play.
+        if (gDevice_IOIsRunning == 0 && lastInputFrameTime >= 0)
+            inputFinalFrameTime = lastInputFrameTime + lastInputBufferFrameSize;
     }
-
-    //    declare the local variables
-    OSStatus theAnswer = 0;
-
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "StopIO: bad driver reference");
-    FailWithAction(
-        inDeviceObjectID != kObjectID_Device, theAnswer = kAudioHardwareBadObjectError, Done, "StopIO: bad device ID");
-
-    //    we need to hold the state lock
-    {
-        CAMutex::Locker locker(stateMutex);
-
-        //    figure out what we need to do
-        if (gDevice_IOIsRunning == 0) {
-            //    underflowing is an error
-            theAnswer = kAudioHardwareIllegalOperationError;
-        } else if (gDevice_IOIsRunning == 1) {
-            //    We need to stop the hardware, which in this case means that there's nothing to do.
-            gDevice_IOIsRunning = 0;
-        } else {
-            //    IO is still running, so just bump the counter
-            --gDevice_IOIsRunning;
-        }
-    }
-    
-    inputIOIsActive = (gDevice_IOIsRunning > 0);
-    ExecuteInAudioOutputThread(^ () { updateOutputDeviceStartedState(); });
-    
-    DebugMsg("ProxyAudio: StopIO finished");
-
-Done:
-    return theAnswer;
+    ExecuteInAudioOutputThread(^{ updateOutputDeviceStartedState(); });
+    return noErr;
 }
 
 OSStatus ProxyAudioDevice::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver,
@@ -5750,7 +5634,6 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
 #pragma unused(inInputData)
 #pragma unused(inInputTime)
     CAMutex::Locker locker1(IOMutex);
-    outputIOProcCallbackCount.fetch_add(1, std::memory_order_release);
 
     // In theory we don't need a locking mechanism here, because outputDevice will only be modified
     // while it is not playing.
@@ -5810,7 +5693,7 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
         return noErr;
     }
 
-    bool overrun = inputBuffer->Fetch(workBuffer, currentOutputDeviceBufferFrameSize, (SInt64)startFrame);
+    inputBuffer->Fetch(workBuffer, currentOutputDeviceBufferFrameSize, (SInt64)startFrame);
 
 #if DEBUG
     // This is just some debugging info to tell when we might be gradually
@@ -5826,13 +5709,6 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     }
 #endif
 
-    if (overrun && inputFinalFrameTime == -1 && startFrame >= inputBuffer->mStartFrame) {
-        // Since this warning could conceivably happen every cycle, explicitly make it
-        // only appear once every five seconds at most
-        // Reporting happens on the control queue, never on the realtime callback.
-        bufferOverrunCount.fetch_add(1, std::memory_order_relaxed);
-    }
-    
     Float32 volumeFactorL = 1.0, volumeFactorR = 1.0;
     calculateVolumeFactors(currentVolumeL, currentVolumeR, currentMute, volumeFactorL, volumeFactorR);
 
