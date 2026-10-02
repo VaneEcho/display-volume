@@ -5202,6 +5202,7 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
                                          kAudioObjectPropertyElementMaster,
                                          outputDeviceAliveListenerStatic,
                                          this);
+        addOutputStreamListeners();
         DebugMsg("ProxyAudio: setupTargetOutputDevice will match sample rate");
         matchOutputDeviceSampleRateNoLock();
         if (preferredDevice.isValid() && preferredDevice.id == newOutputDevice.id) {
@@ -5217,6 +5218,60 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
 }
 
 static const uint64_t kOutputDeviceRebuildDebounceNs = 1200ull * NSEC_PER_MSEC;
+
+void ProxyAudioDevice::addOutputStreamListeners() {
+    removeOutputStreamListeners();
+    if (!outputDevice.isValid()) return;
+
+    AudioObjectPropertyAddress streamsAddress = {kAudioDevicePropertyStreams,
+                                                  kAudioObjectPropertyScopeOutput,
+                                                  kAudioObjectPropertyElementMaster};
+    UInt32 dataSize = 0;
+    OSStatus err = AudioObjectGetPropertyDataSize(outputDevice.id, &streamsAddress, 0, nullptr, &dataSize);
+    if (err != noErr || dataSize == 0) return;
+
+    std::vector<AudioStreamID> streams(dataSize / sizeof(AudioStreamID));
+    err = AudioObjectGetPropertyData(outputDevice.id, &streamsAddress, 0, nullptr, &dataSize, streams.data());
+    if (err != noErr) return;
+
+    const AudioObjectPropertySelector selectors[] = {
+        kAudioStreamPropertyPhysicalFormat,
+        kAudioStreamPropertyAvailablePhysicalFormats,
+        kAudioStreamPropertyIsActive,
+    };
+    for (AudioStreamID stream : streams) {
+        bool registered = false;
+        for (AudioObjectPropertySelector selector : selectors) {
+            AudioObjectPropertyAddress address = {selector,
+                                                   kAudioObjectPropertyScopeGlobal,
+                                                   kAudioObjectPropertyElementMaster};
+            err = AudioObjectAddPropertyListener(stream, &address, outputDeviceAliveListenerStatic, this);
+            if (err == noErr) {
+                registered = true;
+            } else if (err != kAudioHardwareUnknownPropertyError) {
+                syslog(LOG_WARNING, "ProxyAudio: failed to observe HDMI stream property %u (%d)", selector, err);
+            }
+        }
+        if (registered) outputStreamsWithListeners.push_back(stream);
+    }
+}
+
+void ProxyAudioDevice::removeOutputStreamListeners() {
+    const AudioObjectPropertySelector selectors[] = {
+        kAudioStreamPropertyPhysicalFormat,
+        kAudioStreamPropertyAvailablePhysicalFormats,
+        kAudioStreamPropertyIsActive,
+    };
+    for (AudioStreamID stream : outputStreamsWithListeners) {
+        for (AudioObjectPropertySelector selector : selectors) {
+            AudioObjectPropertyAddress address = {selector,
+                                                   kAudioObjectPropertyScopeGlobal,
+                                                   kAudioObjectPropertyElementMaster};
+            AudioObjectRemovePropertyListener(stream, &address, outputDeviceAliveListenerStatic, this);
+        }
+    }
+    outputStreamsWithListeners.clear();
+}
 
 void ProxyAudioDevice::scheduleOutputDeviceRebuild() {
     const int generation = ++outputDeviceChangeGeneration;
@@ -5263,9 +5318,11 @@ void ProxyAudioDevice::startTargetDeviceWatchdog() {
             && callbackCount == lastOutputIOProcCallbackCount) {
             syslog(LOG_WARNING, "ProxyAudio: HDMI output IOProc stopped responding; rebuilding output connection");
             targetDeviceNeedsReset.store(true, std::memory_order_release);
+            setupTargetOutputDevice();
+        } else if (!outputDevice.isValid()) {
+            setupTargetOutputDevice();
         }
         lastOutputIOProcCallbackCount = callbackCount;
-        setupTargetOutputDevice();
     });
     dispatch_resume(targetDeviceWatchdogTimer);
 }
@@ -5296,6 +5353,7 @@ void ProxyAudioDevice::deinitializeOutputDeviceNoLock() {
         outputDevice.stop();
         outputDeviceReady = false;
         notifyHiddenPropertyChanged();
+        removeOutputStreamListeners();
 
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock removing IO proc");
         const AudioObjectPropertyAddress listeners[] = {

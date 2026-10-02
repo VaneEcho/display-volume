@@ -82,6 +82,8 @@ class ProxyAudioDevice {
                             const AudioObjectPropertyAddress *inAddresses);
     void setupAudioDevicesListener();
     void setupTargetOutputDevice();
+    void addOutputStreamListeners();
+    void removeOutputStreamListeners();
     void scheduleOutputDeviceRebuild();
     void scheduleTargetDeviceRetry(int generation);
     void startTargetDeviceWatchdog();
@@ -513,6 +515,7 @@ class ProxyAudioDevice {
     AudioRingBuffer *inputBuffer = NULL;
     Byte *workBuffer = NULL;
     AudioDevice outputDevice;
+    std::vector<AudioStreamID> outputStreamsWithListeners;
     bool outputDeviceReady = false;
     UInt32 configuredBufferRequest = 0;
     std::atomic<UInt32> runtimeState{0}; // 0 connecting, 1 ready, 2 running
