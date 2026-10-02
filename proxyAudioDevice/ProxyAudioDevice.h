@@ -519,6 +519,8 @@ class ProxyAudioDevice {
     std::atomic<UInt32> actualBufferSize{0};
     Float32 previousGainL = 0.0f, previousGainR = 0.0f;
     std::atomic<UInt32> bufferOverrunCount{0};
+    std::atomic<UInt64> outputIOProcCallbackCount{0};
+    UInt64 lastOutputIOProcCallbackCount = 0;
     std::atomic_bool inputIOIsActive;
     Float64 lastInputFrameTime = -1;
     Float64 lastInputBufferFrameSize = -1;

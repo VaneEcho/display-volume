@@ -5175,6 +5175,7 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
             return;
         }
         outputDevice.setupIOProc(outputDeviceIOProcStatic, this);
+        lastOutputIOProcCallbackCount = outputIOProcCallbackCount.load(std::memory_order_acquire);
         if (!outputDevice.procId) {
             outputDevice.invalidate();
             return; // The watchdog will retry incomplete initialization.
@@ -5248,14 +5249,22 @@ void ProxyAudioDevice::startTargetDeviceWatchdog() {
     }
 
     targetDeviceWatchdogTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, AudioOutputDispatchQueue());
+    const uint64_t watchdogIntervalNs = 2ull * NSEC_PER_SEC;
     dispatch_source_set_timer(targetDeviceWatchdogTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, kTargetDeviceRetryIntervalNs),
-                              kTargetDeviceRetryIntervalNs,
+                              dispatch_time(DISPATCH_TIME_NOW, watchdogIntervalNs),
+                              watchdogIntervalNs,
                               250ull * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(targetDeviceWatchdogTimer, ^{
         const auto overruns = bufferOverrunCount.exchange(0, std::memory_order_relaxed);
         if (overruns) syslog(LOG_WARNING, "ProxyAudio: %u output underruns in the last interval", overruns);
         DebugMsg("ProxyAudio: target device watchdog firing");
+        const UInt64 callbackCount = outputIOProcCallbackCount.load(std::memory_order_acquire);
+        if (outputDevice.isValid() && outputDeviceReady && outputDevice.isStarted
+            && callbackCount == lastOutputIOProcCallbackCount) {
+            syslog(LOG_WARNING, "ProxyAudio: HDMI output IOProc stopped responding; rebuilding output connection");
+            targetDeviceNeedsReset.store(true, std::memory_order_release);
+        }
+        lastOutputIOProcCallbackCount = callbackCount;
         setupTargetOutputDevice();
     });
     dispatch_resume(targetDeviceWatchdogTimer);
@@ -5683,6 +5692,7 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
 #pragma unused(inInputData)
 #pragma unused(inInputTime)
     CAMutex::Locker locker1(IOMutex);
+    outputIOProcCallbackCount.fetch_add(1, std::memory_order_release);
 
     // In theory we don't need a locking mechanism here, because outputDevice will only be modified
     // while it is not playing.
