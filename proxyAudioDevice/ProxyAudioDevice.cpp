@@ -4957,11 +4957,8 @@ int ProxyAudioDevice::outputDeviceAliveListener(AudioObjectID inObjectID,
 #pragma unused(inNumberAddresses)
 #pragma unused(inAddresses)
 
-    DebugMsg("ProxyAudio: outputDeviceAliveListener");
-    targetDeviceNeedsReset.store(true, std::memory_order_release);
-    ExecuteInAudioOutputThread(^() {
-        setupTargetOutputDevice();
-    });
+    DebugMsg("ProxyAudio: output device state/configuration changed");
+    scheduleOutputDeviceRebuild();
 
     return noErr;
 }
@@ -5008,9 +5005,9 @@ int ProxyAudioDevice::devicesListenerProc(AudioObjectID inObjectID,
 #pragma unused(inNumberAddresses)
 #pragma unused(inAddresses)
     DebugMsg("ProxyAudio: devicesListenerProc current devices changed");
-    ExecuteInAudioOutputThread(^() {
-        setupTargetOutputDevice();
-    });
+    // The selected display can keep the same UID and AudioDeviceID across HDR/EDID
+    // renegotiation. A system device-list change must still re-create its IO proc.
+    scheduleOutputDeviceRebuild();
     return noErr;
 }
 
@@ -5149,7 +5146,10 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
         && outputDevice.procId != nullptr && outputDeviceReady
         && configuredBufferRequest == requestedBufferSize
         && outputDevice.bufferFrameSize == newOutputDevice.bufferFrameSize
-        && outputDevice.sampleRate == newOutputDevice.sampleRate) {
+        && outputDevice.sampleRate == newOutputDevice.sampleRate
+        && outputDevice.safetyOffset == newOutputDevice.safetyOffset
+        && outputDevice.stereoChannels[0] == newOutputDevice.stereoChannels[0]
+        && outputDevice.stereoChannels[1] == newOutputDevice.stereoChannels[1]) {
         DebugMsg("ProxyAudio: setupTargetOutputDevice no change in device");
         if (!preferredDevice.isValid()) {
             scheduleTargetDeviceRetry(generation);
@@ -5213,6 +5213,18 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
     if (!preferredDevice.isValid()) {
         scheduleTargetDeviceRetry(generation);
     }
+}
+
+static const uint64_t kOutputDeviceRebuildDebounceNs = 1200ull * NSEC_PER_MSEC;
+
+void ProxyAudioDevice::scheduleOutputDeviceRebuild() {
+    const int generation = ++outputDeviceChangeGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kOutputDeviceRebuildDebounceNs),
+                   AudioOutputDispatchQueue(), ^{
+        if (generation != outputDeviceChangeGeneration.load()) return;
+        targetDeviceNeedsReset.store(true, std::memory_order_release);
+        setupTargetOutputDevice();
+    });
 }
 
 static const uint64_t kTargetDeviceRetryIntervalNs = 5ull * NSEC_PER_SEC;
